@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/environment"
 	"io"
 	"io/ioutil"
 	"os"
@@ -12,13 +13,6 @@ import (
 )
 
 var stateMutex sync.Mutex
-
-const (
-	ProcessOfflineState  = "offline"
-	ProcessStartingState = "starting"
-	ProcessRunningState  = "running"
-	ProcessStoppingState = "stopping"
-)
 
 // Returns the state of the servers.
 func getServerStates() (map[string]string, error) {
@@ -70,7 +64,10 @@ func saveServerStates() error {
 // Sets the state of the server internally. This function handles crash detection as
 // well as reporting to event listeners for the server.
 func (s *Server) SetState(state string) error {
-	if state != ProcessOfflineState && state != ProcessStartingState && state != ProcessRunningState && state != ProcessStoppingState {
+	if state != environment.ProcessOfflineState &&
+		state != environment.ProcessStartingState &&
+		state != environment.ProcessRunningState &&
+		state != environment.ProcessStoppingState {
 		return errors.New(fmt.Sprintf("invalid server state received: %s", state))
 	}
 
@@ -99,6 +96,16 @@ func (s *Server) SetState(state string) error {
 		}
 	}()
 
+	// Reset the resource usage to 0 when the process fully stops so that all of the UI
+	// views in the Panel correctly display 0.
+	if state == environment.ProcessOfflineState {
+		s.resources.mu.Lock()
+		s.resources.Empty()
+		s.resources.mu.Unlock()
+
+		s.emitProcUsage()
+	}
+
 	// If server was in an online state, and is now in an offline state we should handle
 	// that as a crash event. In that scenario, check the last crash time, and the crash
 	// counter.
@@ -107,7 +114,7 @@ func (s *Server) SetState(state string) error {
 	// automatically attempt to start the process back up for the user. This is done in a
 	// separate thread as to not block any actions currently taking place in the flow
 	// that called this function.
-	if (prevState == ProcessStartingState || prevState == ProcessRunningState) && s.GetState() == ProcessOfflineState {
+	if (prevState == environment.ProcessStartingState || prevState == environment.ProcessRunningState) && s.GetState() == environment.ProcessOfflineState {
 		s.Log().Info("detected server as entering a crashed state; running crash handler")
 
 		go func(server *Server) {
@@ -135,5 +142,5 @@ func (s *Server) GetState() string {
 func (s *Server) IsRunning() bool {
 	st := s.GetState()
 
-	return st == ProcessRunningState || st == ProcessStartingState
+	return st == environment.ProcessRunningState || st == environment.ProcessStartingState
 }

@@ -20,12 +20,10 @@ func (s *Server) notifyPanelOfBackup(uuid string, ad *backup.ArchiveDetails, suc
 			s.Log().WithFields(log.Fields{
 				"backup": uuid,
 				"error":  err,
-			}).Error("failed to notify panel of backup status due to internal code error")
+			}).Error("failed to notify panel of backup status due to wings error")
 
 			return err
 		}
-
-		s.Log().WithField("backup", uuid).Warn(rerr.String())
 
 		return errors.New(rerr.String())
 	}
@@ -90,11 +88,19 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 		if notifyError := s.notifyPanelOfBackup(b.Identifier(), &backup.ArchiveDetails{}, false); notifyError != nil {
 			s.Log().WithFields(log.Fields{
 				"backup": b.Identifier(),
-				"error":  err,
+				"error":  notifyError,
 			}).Warn("failed to notify panel of failed backup state")
 		}
 
-		return errors.WithStack(err)
+		s.Events().PublishJson(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
+			"uuid":          b.Identifier(),
+			"is_successful": false,
+			"checksum":      "",
+			"checksum_type": "sha1",
+			"file_size":     0,
+		})
+
+		return errors.Wrap(err, "error while generating server backup")
 	}
 
 	// Try to notify the panel about the status of this backup. If for some reason this request
@@ -108,9 +114,11 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 	// Emit an event over the socket so we can update the backup in realtime on
 	// the frontend for the server.
 	s.Events().PublishJson(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
-		"uuid":        b.Identifier(),
-		"sha256_hash": ad.Checksum,
-		"file_size":   ad.Size,
+		"uuid":          b.Identifier(),
+		"is_successful": true,
+		"checksum":      ad.Checksum,
+		"checksum_type": "sha1",
+		"file_size":     ad.Size,
 	})
 
 	return nil

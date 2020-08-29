@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/apex/log"
@@ -9,10 +10,10 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/environment"
 	"github.com/pterodactyl/wings/router/tokens"
 	"github.com/pterodactyl/wings/server"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -57,7 +58,20 @@ func GetHandler(s *server.Server, w http.ResponseWriter, r *http.Request) (*Hand
 		// Ensure that the websocket request is originating from the Panel itself,
 		// and not some other location.
 		CheckOrigin: func(r *http.Request) bool {
-			return r.Header.Get("Origin") == config.Get().PanelLocation
+			o := r.Header.Get("Origin")
+			if o == config.Get().PanelLocation {
+				return true
+			}
+
+			for _, origin := range config.Get().AllowedOrigins {
+				if o != origin {
+					continue
+				}
+
+				return true
+			}
+
+			return false
 		},
 	}
 
@@ -137,7 +151,7 @@ func (h *Handler) TokenValid() error {
 // Sends an error back to the connected websocket instance by checking the permissions
 // of the token. If the user has the "receive-errors" grant we will send back the actual
 // error message, otherwise we just send back a standard error message.
-func (h *Handler) SendErrorJson(msg Message, err error) error {
+func (h *Handler) SendErrorJson(msg Message, err error, shouldLog ...bool) error {
 	j := h.GetJwt()
 
 	message := "an unexpected error was encountered while handling this request"
@@ -150,9 +164,11 @@ func (h *Handler) SendErrorJson(msg Message, err error) error {
 	wsm := Message{Event: ErrorEvent}
 	wsm.Args = []string{m}
 
-	if !server.IsSuspendedError(err) {
-		h.server.Log().WithFields(log.Fields{"event": msg.Event, "error_identifier": u.String(), "error": err}).
-			Error("failed to handle websocket process; an error was encountered processing an event")
+	if len(shouldLog) == 0 || (len(shouldLog) == 1 && shouldLog[0] == true) {
+		if !server.IsSuspendedError(err) {
+			h.server.Log().WithFields(log.Fields{"event": msg.Event, "error_identifier": u.String(), "error": err}).
+				Error("failed to handle websocket process; an error was encountered processing an event")
+		}
 	}
 
 	return h.unsafeSendJson(wsm)
@@ -244,7 +260,7 @@ func (h *Handler) HandleInbound(m Message) error {
 
 			// Only send the current disk usage if the server is offline, if docker container is running,
 			// Environment#EnableResourcePolling() will send this data to all clients.
-			if state == server.ProcessOfflineState {
+			if state == environment.ProcessOfflineState {
 				_ = h.server.Filesystem.HasSpaceAvailable()
 
 				b, _ := json.Marshal(h.server.Proc())
@@ -258,37 +274,34 @@ func (h *Handler) HandleInbound(m Message) error {
 		}
 	case SetStateEvent:
 		{
-			switch strings.Join(m.Args, "") {
-			case "start":
-				if h.GetJwt().HasPermission(PermissionSendPowerStart) {
-					return h.server.Environment.Start()
-				}
-				break
-			case "stop":
-				if h.GetJwt().HasPermission(PermissionSendPowerStop) {
-					return h.server.Environment.Stop()
-				}
-				break
-			case "restart":
-				if h.GetJwt().HasPermission(PermissionSendPowerRestart) {
-					// If the server is alreay restarting don't do anything. Perhaps we send back an event
-					// in the future for this? For now no reason to knowingly trigger an error by trying to
-					// restart a process already restarting.
-					if h.server.Environment.IsRestarting() {
-						return nil
-					}
+			action := server.PowerAction(strings.Join(m.Args, ""))
 
-					return h.server.Environment.Restart()
+			actions := make(map[server.PowerAction]string)
+			actions[server.PowerActionStart] = PermissionSendPowerStart
+			actions[server.PowerActionStop] = PermissionSendPowerStop
+			actions[server.PowerActionRestart] = PermissionSendPowerRestart
+			actions[server.PowerActionTerminate] = PermissionSendPowerStop
+
+			// Check that they have permission to perform this action if it is needed.
+			if permission, exists := actions[action]; exists {
+				if !h.GetJwt().HasPermission(permission) {
+					return nil
 				}
-				break
-			case "kill":
-				if h.GetJwt().HasPermission(PermissionSendPowerStop) {
-					return h.server.Environment.Terminate(os.Kill)
-				}
-				break
 			}
 
-			return nil
+			err := h.server.HandlePowerAction(action)
+			if errors.Is(err, context.DeadlineExceeded) {
+				m, _ := h.GetErrorMessage("another power action is currently being processed for this server, please try again later")
+
+				h.SendJson(&Message{
+					Event: ErrorEvent,
+					Args:  []string{m},
+				})
+
+				return nil
+			}
+
+			return err
 		}
 	case SendServerLogsEvent:
 		{
@@ -316,7 +329,7 @@ func (h *Handler) HandleInbound(m Message) error {
 				return nil
 			}
 
-			if h.server.GetState() == server.ProcessOfflineState {
+			if h.server.GetState() == environment.ProcessOfflineState {
 				return nil
 			}
 

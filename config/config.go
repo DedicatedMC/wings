@@ -1,19 +1,16 @@
 package config
 
 import (
-	"errors"
 	"fmt"
-	"github.com/apex/log"
 	"github.com/cobaugh/osrelease"
 	"github.com/creasty/defaults"
 	"github.com/gbrlsnchs/jwt/v3"
+	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/user"
-	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,31 +55,20 @@ type Configuration struct {
 
 	// Defines internal throttling configurations for server processes to prevent
 	// someone from running an endless loop that spams data to logs.
-	Throttles struct {
-		// The number of data overage warnings (inclusive) that can accumulate
-		// before a process is terminated.
-		KillAtCount int `default:"5" yaml:"kill_at_count"`
-
-		// The number of seconds that must elapse before the internal counter
-		// begins decrementing warnings assigned to a process that is outputting
-		// too much data.
-		DecaySeconds int `default:"10" json:"decay" yaml:"decay"`
-
-		// The total number of bytes allowed to be output by a server process
-		// per interval.
-		BytesPerInterval int `default:"4096" json:"bytes" yaml:"bytes"`
-
-		// The amount of time that should lapse between data output throttle
-		// checks. This should be defined in milliseconds.
-		CheckInterval int `default:"100" yaml:"check_interval"`
-	}
+	Throttles ConsoleThrottles
 
 	// The location where the panel is running that this daemon should connect to
 	// to collect data and send events.
 	PanelLocation string `json:"remote" yaml:"remote"`
 
-	// AllowedMounts .
+	// AllowedMounts is a list of allowed host-system mount points.
+	// This is required to have the "Server Mounts" feature work properly.
 	AllowedMounts []string `json:"allowed_mounts" yaml:"allowed_mounts"`
+
+	// AllowedOrigins is a list of allowed request origins.
+	// The Panel URL is automatically allowed, this is only needed for adding
+	// additional origins.
+	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
 }
 
 // Defines the configuration of the internal SFTP server.
@@ -148,7 +134,7 @@ func ReadConfiguration(path string) (*Configuration, error) {
 	return c, nil
 }
 
-var Mutex sync.RWMutex
+var mu sync.RWMutex
 
 var _config *Configuration
 var _jwtAlgo *jwt.HMACSHA
@@ -158,14 +144,14 @@ var _debugViaFlag bool
 // anything trying to set a different configuration value, or read the configuration
 // will be paused until it is complete.
 func Set(c *Configuration) {
-	Mutex.Lock()
+	mu.Lock()
 
 	if _config == nil || _config.AuthenticationToken != c.AuthenticationToken {
 		_jwtAlgo = jwt.NewHS256([]byte(c.AuthenticationToken))
 	}
 
 	_config = c
-	Mutex.Unlock()
+	mu.Unlock()
 }
 
 func SetDebugViaFlag(d bool) {
@@ -175,16 +161,16 @@ func SetDebugViaFlag(d bool) {
 // Get the global configuration instance. This is a read-safe operation that will block
 // if the configuration is presently being modified.
 func Get() *Configuration {
-	Mutex.RLock()
-	defer Mutex.RUnlock()
+	mu.RLock()
+	defer mu.RUnlock()
 
 	return _config
 }
 
 // Returns the in-memory JWT algorithm.
 func GetJwtAlgorithm() *jwt.HMACSHA {
-	Mutex.RLock()
-	defer Mutex.RUnlock()
+	mu.RLock()
+	defer mu.RUnlock()
 
 	return _jwtAlgo
 }
@@ -193,7 +179,7 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 func NewFromPath(path string) (*Configuration, error) {
 	c := new(Configuration)
 	if err := defaults.Set(c); err != nil {
-		return c, err
+		return c, errors.WithStack(err)
 	}
 
 	c.unsafeSetPath(path)
@@ -231,12 +217,12 @@ func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
 	if err == nil {
 		return u, c.setSystemUser(u)
 	} else if _, ok := err.(user.UnknownUserError); !ok {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	sysName, err := getSystemName()
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	var command = fmt.Sprintf("useradd --system --no-create-home --shell /bin/false %s", c.System.Username)
@@ -249,17 +235,17 @@ func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
 		// We have to create the group first on Alpine, so do that here before continuing on
 		// to the user creation process.
 		if _, err := exec.Command("addgroup", "-S", c.System.Username).Output(); err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 	}
 
 	split := strings.Split(command, " ")
 	if _, err := exec.Command(split[0], split[1:]...).Output(); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	if u, err := user.Lookup(c.System.Username); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	} else {
 		return u, c.setSystemUser(u)
 	}
@@ -278,58 +264,6 @@ func (c *Configuration) setSystemUser(u *user.User) error {
 	c.Unlock()
 
 	return c.WriteToDisk()
-}
-
-// Ensures that the configured data directory has the correct permissions assigned to
-// all of the files and folders within.
-func (c *Configuration) EnsureFilePermissions() error {
-	// Don't run this unless it is configured to be run. On large system this can often slow
-	// things down dramatically during the boot process.
-	if !c.System.SetPermissionsOnBoot {
-		return nil
-	}
-
-	r := regexp.MustCompile("^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$")
-
-	files, err := ioutil.ReadDir(c.System.Data)
-	if err != nil {
-		return err
-	}
-
-	su, err := user.Lookup(c.System.Username)
-	if err != nil {
-		return err
-	}
-
-	wg := new(sync.WaitGroup)
-
-	for _, file := range files {
-		wg.Add(1)
-
-		// Asynchronously run through the list of files and folders in the data directory. If
-		// the item is not a folder, or is not a folder that matches the expected UUIDv4 format
-		// skip over it.
-		//
-		// If we do have a positive match, run a chown against the directory.
-		go func(f os.FileInfo) {
-			defer wg.Done()
-
-			if !f.IsDir() || !r.MatchString(f.Name()) {
-				return
-			}
-
-			uid, _ := strconv.Atoi(su.Uid)
-			gid, _ := strconv.Atoi(su.Gid)
-
-			if err := os.Chown(path.Join(c.System.Data, f.Name()), uid, gid); err != nil {
-				log.WithField("error", err).WithField("directory", f.Name()).Warn("failed to chown server directory")
-			}
-		}(file)
-	}
-
-	wg.Wait()
-
-	return nil
 }
 
 // Writes the configuration to the disk as a blocking operation by obtaining an exclusive
@@ -353,11 +287,11 @@ func (c *Configuration) WriteToDisk() error {
 
 	b, err := yaml.Marshal(&ccopy)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	if err := ioutil.WriteFile(c.GetPath(), b, 0644); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	return nil
@@ -367,7 +301,7 @@ func (c *Configuration) WriteToDisk() error {
 func getSystemName() (string, error) {
 	// use osrelease to get release version and ID
 	if release, err := osrelease.Read(); err != nil {
-		return "", err
+		return "", errors.WithStack(err)
 	} else {
 		return release["ID"], nil
 	}

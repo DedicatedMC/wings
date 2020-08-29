@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var Default = New(os.Stderr)
+var Default = New(os.Stderr, true)
 
 var bold = color2.New(color2.Bold)
 
@@ -31,12 +31,14 @@ type Handler struct {
 	Padding int
 }
 
-func New(w io.Writer) *Handler {
+func New(w io.Writer, useColors bool) *Handler {
 	if f, ok := w.(*os.File); ok {
-		return &Handler{Writer: colorable.NewColorable(f), Padding: 2}
+		if useColors {
+			return &Handler{Writer: colorable.NewColorable(f), Padding: 2}
+		}
 	}
 
-	return &Handler{Writer: w, Padding: 2}
+	return &Handler{Writer: colorable.NewNonColorable(w), Padding: 2}
 }
 
 type tracer interface {
@@ -81,7 +83,7 @@ func (h *Handler) HandleLog(e *log.Entry) error {
 }
 
 func getErrorStack(err error, i bool) errors.StackTrace {
-	e, ok := errors.Cause(err).(tracer)
+	e, ok := err.(tracer)
 	if !ok {
 		if i {
 			// Just abort out of this and return a stacktrace leading up to this point. It isn't perfect
@@ -89,7 +91,7 @@ func getErrorStack(err error, i bool) errors.StackTrace {
 			return errors.Wrap(err, "failed to generate stacktrace for caught error").(tracer).StackTrace()
 		}
 
-		return getErrorStack(errors.New(err.Error()), true)
+		return getErrorStack(errors.Wrap(err, err.Error()), true)
 	}
 
 	st := e.StackTrace()

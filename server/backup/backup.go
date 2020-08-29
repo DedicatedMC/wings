@@ -1,7 +1,7 @@
 package backup
 
 import (
-	"crypto/sha256"
+	"crypto/sha1"
 	"encoding/hex"
 	"github.com/apex/log"
 	"github.com/pkg/errors"
@@ -19,16 +19,18 @@ const (
 )
 
 type ArchiveDetails struct {
-	Checksum string `json:"checksum"`
-	Size     int64  `json:"size"`
+	Checksum     string `json:"checksum"`
+	ChecksumType string `json:"checksum_type"`
+	Size         int64  `json:"size"`
 }
 
 // Returns a request object.
 func (ad *ArchiveDetails) ToRequest(successful bool) api.BackupRequest {
 	return api.BackupRequest{
-		Checksum:   ad.Checksum,
-		Size:       ad.Size,
-		Successful: successful,
+		Checksum:     ad.Checksum,
+		ChecksumType: ad.ChecksumType,
+		Size:         ad.Size,
+		Successful:   successful,
 	}
 }
 
@@ -93,16 +95,17 @@ func (b *Backup) Size() (int64, error) {
 
 // Returns the SHA256 checksum of a backup.
 func (b *Backup) Checksum() ([]byte, error) {
-	h := sha256.New()
+	h := sha1.New()
 
 	f, err := os.Open(b.Path())
 	if err != nil {
-		return []byte{}, errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(h, f); err != nil {
-		return []byte{}, errors.WithStack(err)
+	buf := make([]byte, 1024*4)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+		return nil, err
 	}
 
 	return h.Sum(nil), nil
@@ -123,7 +126,7 @@ func (b *Backup) Details() *ArchiveDetails {
 		if err != nil {
 			log.WithFields(log.Fields{
 				"backup": b.Identifier(),
-				"error": err,
+				"error":  err,
 			}).Error("failed to calculate checksum for backup")
 		}
 
@@ -144,8 +147,9 @@ func (b *Backup) Details() *ArchiveDetails {
 	wg.Wait()
 
 	return &ArchiveDetails{
-		Checksum: checksum,
-		Size:     sz,
+		Checksum:     checksum,
+		ChecksumType: "sha1",
+		Size:         sz,
 	}
 }
 

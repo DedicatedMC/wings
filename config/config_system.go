@@ -33,23 +33,16 @@ type SystemConfiguration struct {
 		Gid int
 	}
 
-	// Determines if permissions for a server should be set automatically on
-	// daemon boot. This can take a long time on systems with many servers, or on
-	// systems with servers containing thousands of files.
-	//
-	// Setting this to true by default helps us avoid a lot of support requests
-	// from people that keep trying to move files around as a root user leading
-	// to server permission issues.
-	//
-	// In production and heavy use environments where boot speed is essential,
-	// this should be set to false as servers will self-correct permissions on
-	// boot anyways.
-	SetPermissionsOnBoot bool `default:"true" yaml:"set_permissions_on_boot"`
-
 	// Determines if Wings should detect a server that stops with a normal exit code of
 	// "0" as being crashed if the process stopped without any Wings interaction. E.g.
 	// the user did not press the stop button, but the process stopped cleanly.
 	DetectCleanExitAsCrash bool `default:"true" yaml:"detect_clean_exit_as_crash"`
+
+	// If set to true, file permissions for a server will be checked when the process is
+	// booted. This can cause boot delays if the server has a large amount of files. In most
+	// cases disabling this should not have any major impact unless external processes are
+	// frequently modifying a servers' files.
+	CheckPermissionsOnBoot bool `default:"true" yaml:"check_permissions_on_boot"`
 
 	Sftp SftpConfiguration `yaml:"sftp"`
 }
@@ -59,11 +52,6 @@ type SystemConfiguration struct {
 func (sc *SystemConfiguration) ConfigureDirectories() error {
 	log.WithField("path", sc.RootDirectory).Debug("ensuring root data directory exists")
 	if err := os.MkdirAll(sc.RootDirectory, 0700); err != nil {
-		return err
-	}
-
-	log.WithField("path", sc.LogDirectory).Debug("ensuring log directory exists")
-	if err := os.MkdirAll(path.Join(sc.LogDirectory, "/install"), 0700); err != nil {
 		return err
 	}
 

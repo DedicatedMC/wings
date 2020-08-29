@@ -1,14 +1,41 @@
-package server
+package environment
 
 import (
+	"github.com/pterodactyl/wings/events"
 	"os"
+)
+
+const (
+	ConsoleOutputEvent = "console output"
+	StateChangeEvent   = "state change"
+	ResourceEvent      = "resources"
+)
+
+const (
+	ProcessOfflineState  = "offline"
+	ProcessStartingState = "starting"
+	ProcessRunningState  = "running"
+	ProcessStoppingState = "stopping"
 )
 
 // Defines the basic interface that all environments need to implement so that
 // a server can be properly controlled.
-type Environment interface {
+type ProcessEnvironment interface {
 	// Returns the name of the environment.
 	Type() string
+
+	// Returns the environment configuration to the caller.
+	Config() *Configuration
+
+	// Returns an event emitter instance that can be hooked into to listen for different
+	// events that are fired by the environment. This should not allow someone to publish
+	// events, only subscribe to them.
+	Events() *events.EventBus
+
+	// Determines if the server instance exists. For example, in a docker environment
+	// this should confirm that the container is created and in a bootable state. In
+	// a basic CLI environment this can probably just return true right away.
+	Exists() (bool, error)
 
 	// Determines if the environment is currently active and running a server process
 	// for this specific server instance.
@@ -31,22 +58,10 @@ type Environment interface {
 	// not be returned.
 	Stop() error
 
-	// Restart a server instance. If already stopped the process will be started. This function
-	// will return an error if the server is already performing a restart process as to avoid
-	// unnecessary double/triple/quad looping issues if multiple people press restart or spam the
-	// button to restart.
-	Restart() error
-	IsRestarting() bool
-
 	// Waits for a server instance to stop gracefully. If the server is still detected
 	// as running after seconds, an error will be returned, or the server will be terminated
 	// depending on the value of the second argument.
-	WaitForStop(seconds int, terminate bool) error
-
-	// Determines if the server instance exists. For example, in a docker environment
-	// this should confirm that the container is created and in a bootable state. In
-	// a basic CLI environment this can probably just return true right away.
-	Exists() (bool, error)
+	WaitForStop(seconds uint, terminate bool) error
 
 	// Terminates a running server instance using the provided signal. If the server
 	// is not running no error should be returned.
@@ -70,22 +85,10 @@ type Environment interface {
 	// send data into the environment's stdin.
 	Attach() error
 
-	// Follows the output from the server console and will begin piping the output to
-	// the server's emitter.
-	FollowConsoleOutput() error
-
 	// Sends the provided command to the running server instance.
 	SendCommand(string) error
 
 	// Reads the log file for the process from the end backwards until the provided
 	// number of bytes is met.
 	Readlog(int64) ([]string, error)
-
-	// Polls the given environment for resource usage of the server when the process
-	// is running.
-	EnableResourcePolling() error
-
-	// Disables the polling operation for resource usage and sets the required values
-	// to 0 in the server resource usage struct.
-	DisableResourcePolling() error
 }

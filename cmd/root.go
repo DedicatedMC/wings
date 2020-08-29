@@ -3,9 +3,14 @@ package cmd
 import (
 	"crypto/tls"
 	"fmt"
+	"github.com/NYTimes/logrotate"
+	"github.com/apex/log/handlers/multi"
+	"github.com/gammazero/workerpool"
+	"golang.org/x/crypto/acme"
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/apex/log"
@@ -21,7 +26,6 @@ import (
 	"github.com/pterodactyl/wings/server"
 	"github.com/pterodactyl/wings/sftp"
 	"github.com/pterodactyl/wings/system"
-	"github.com/remeh/sizedwaitgroup"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
@@ -111,14 +115,14 @@ func rootCmdRun(*cobra.Command, []string) {
 	}
 
 	printLogo()
-	if err := configureLogging(c.Debug); err != nil {
+	if err := configureLogging(c.System.LogDirectory, c.Debug); err != nil {
 		panic(err)
 	}
 
 	log.WithField("path", c.GetPath()).Info("loading configuration from path")
 	if c.Debug {
 		log.Debug("running in debug mode")
-		log.Info("certificate checking is disabled")
+		log.Warn("certificate checking is disabled")
 
 		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
@@ -129,14 +133,15 @@ func rootCmdRun(*cobra.Command, []string) {
 	config.SetDebugViaFlag(debug)
 
 	if err := c.System.ConfigureDirectories(); err != nil {
-		log.Fatal("failed to configure system directories for pterodactyl")
-		panic(err)
+		log.WithError(err).Fatal("failed to configure system directories for pterodactyl")
+		os.Exit(1)
+		return
 	}
 
 	log.WithField("username", c.System.Username).Info("checking for pterodactyl system user")
 	if su, err := c.EnsurePterodactylUser(); err != nil {
-		log.Error("failed to create pterodactyl system user")
-		panic(err)
+		log.WithError(err).Error("failed to create pterodactyl system user")
+		os.Exit(1)
 		return
 	} else {
 		log.WithFields(log.Fields{
@@ -144,13 +149,6 @@ func rootCmdRun(*cobra.Command, []string) {
 			"uid":      su.Uid,
 			"gid":      su.Gid,
 		}).Info("configured system user successfully")
-	}
-
-	log.Info("beginning file permission setting on server data directories")
-	if err := c.EnsureFilePermissions(); err != nil {
-		log.WithField("error", err).Error("failed to properly chown data directories")
-	} else {
-		log.Info("finished ensuring file permissions")
 	}
 
 	if err := server.LoadDirectory(); err != nil {
@@ -172,19 +170,16 @@ func rootCmdRun(*cobra.Command, []string) {
 		log.WithField("server", s.Id()).Info("loaded configuration for server")
 	}
 
-	// Create a new WaitGroup that limits us to 4 servers being bootstrapped at a time
+	// Create a new workerpool that limits us to 4 servers being bootstrapped at a time
 	// on Wings. This allows us to ensure the environment exists, write configurations,
 	// and reboot processes without causing a slow-down due to sequential booting.
-	wg := sizedwaitgroup.New(4)
+	pool := workerpool.New(4)
 
 	for _, serv := range server.GetServers().All() {
-		wg.Add()
+		s := serv
 
-		go func(s *server.Server) {
-			defer wg.Done()
-
+		pool.Submit(func() {
 			s.Log().Info("ensuring server environment exists")
-
 			// Create a server environment if none exists currently. This allows us to recover from Docker
 			// being reinstalled on the host system for example.
 			if err := s.Environment.Create(); err != nil {
@@ -204,8 +199,10 @@ func rootCmdRun(*cobra.Command, []string) {
 			// is that it was running, but we see that the container process is not currently running.
 			if r || (!r && s.IsRunning()) {
 				s.Log().Info("detected server is running, re-attaching to process...")
-				if err := s.Environment.Start(); err != nil {
-					s.Log().WithField("error", errors.WithStack(err)).Warn("failed to properly start server detected as already running")
+
+				s.SetState(environment.ProcessRunningState)
+				if err := s.Environment.Attach(); err != nil {
+					s.Log().WithField("error", errors.WithStack(err)).Warn("failed to attach to running server environment")
 				}
 
 				return
@@ -213,15 +210,19 @@ func rootCmdRun(*cobra.Command, []string) {
 
 			// Addresses potentially invalid data in the stored file that can cause Wings to lose
 			// track of what the actual server state is.
-			s.SetState(server.ProcessOfflineState)
-		}(serv)
+			_ = s.SetState(environment.ProcessOfflineState)
+		})
 	}
 
-	// Wait until all of the servers are ready to go before we fire up the HTTP server.
-	wg.Wait()
+	// Wait until all of the servers are ready to go before we fire up the SFTP and HTTP servers.
+	pool.StopWait()
 
-	// Initalize SFTP.
-	sftp.Initialize(c)
+	// Initialize the SFTP server.
+	if err := sftp.Initialize(c); err != nil {
+		log.WithError(err).Error("failed to initialize the sftp server")
+		os.Exit(1)
+		return
+	}
 
 	// Ensure the archive directory exists.
 	if err := os.MkdirAll(c.System.ArchiveDirectory, 0755); err != nil {
@@ -240,9 +241,46 @@ func rootCmdRun(*cobra.Command, []string) {
 		"host_port":    c.Api.Port,
 	}).Info("configuring internal webserver")
 
+	// Configure the router.
 	r := router.Configure()
-	addr := fmt.Sprintf("%s:%d", c.Api.Host, c.Api.Port)
 
+	s := &http.Server{
+		Addr:    fmt.Sprintf("%s:%d", c.Api.Host, c.Api.Port),
+		Handler: r,
+
+		TLSConfig: &tls.Config{
+			NextProtos: []string{
+				"h2", // enable HTTP/2
+				"http/1.1",
+			},
+
+			// https://blog.cloudflare.com/exposing-go-on-the-internet
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			},
+
+			PreferServerCipherSuites: true,
+
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS13,
+
+			CurvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+			},
+			// END https://blog.cloudflare.com/exposing-go-on-the-internet
+		},
+	}
+
+	// Check if the server should run with TLS but using autocert.
 	if useAutomaticTls && len(tlsHostname) > 0 {
 		m := autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
@@ -251,28 +289,43 @@ func rootCmdRun(*cobra.Command, []string) {
 		}
 
 		log.WithField("hostname", tlsHostname).
-			Info("webserver is now listening with auto-TLS enabled; certifcates will be automatically generated by Let's Encrypt")
+			Info("webserver is now listening with auto-TLS enabled; certificates will be automatically generated by Let's Encrypt")
 
-		// We don't use the autotls runner here since we need to specify a port other than 443
-		// to be using for SSL connections for Wings.
-		s := &http.Server{Addr: addr, TLSConfig: m.TLSConfig(), Handler: r}
+		// Hook autocert into the main http server.
+		s.TLSConfig.GetCertificate = m.GetCertificate
+		s.TLSConfig.NextProtos = append(s.TLSConfig.NextProtos, acme.ALPNProto) // enable tls-alpn ACME challenges
 
-		go http.ListenAndServe(":http", m.HTTPHandler(nil))
+		// Start the autocert server.
+		go func() {
+			if err := http.ListenAndServe(":http", m.HTTPHandler(nil)); err != nil {
+				log.WithError(err).Error("failed to serve autocert http server")
+			}
+		}()
+
+		// Start the main http server with TLS using autocert.
 		if err := s.ListenAndServeTLS("", ""); err != nil {
 			log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlsHostname, "error": err}).
 				Fatal("failed to configure HTTP server using auto-tls")
 			os.Exit(1)
 		}
-	} else if c.Api.Ssl.Enabled {
-		if err := r.RunTLS(addr, c.Api.Ssl.CertificateFile, c.Api.Ssl.KeyFile); err != nil {
+
+		return
+	}
+
+	// Check if main http server should run with TLS.
+	if c.Api.Ssl.Enabled {
+		if err := s.ListenAndServeTLS(c.Api.Ssl.CertificateFile, c.Api.Ssl.KeyFile); err != nil {
 			log.WithFields(log.Fields{"auto_tls": false, "error": err}).Fatal("failed to configure HTTPS server")
 			os.Exit(1)
 		}
-	} else {
-		if err := r.Run(addr); err != nil {
-			log.WithField("error", err).Fatal("failed to configure HTTP server")
-			os.Exit(1)
-		}
+		return
+	}
+
+	// Run the main http server without TLS.
+	s.TLSConfig = nil
+	if err := s.ListenAndServe(); err != nil {
+		log.WithField("error", err).Fatal("failed to configure HTTP server")
+		os.Exit(1)
 	}
 }
 
@@ -283,7 +336,11 @@ func Execute() error {
 
 // Configures the global logger for Zap so that we can call it from any location
 // in the code without having to pass around a logger instance.
-func configureLogging(debug bool) error {
+func configureLogging(logDir string, debug bool) error {
+	if err := os.MkdirAll(path.Join(logDir, "/install"), 0700); err != nil {
+		return errors.WithStack(err)
+	}
+
 	cfg := zap.NewProductionConfig()
 	if debug {
 		cfg = zap.NewDevelopmentConfig()
@@ -301,27 +358,42 @@ func configureLogging(debug bool) error {
 
 	zap.ReplaceGlobals(logger)
 
-	log.SetHandler(cli.Default)
+	p := filepath.Join(logDir, "/wings.log")
+	w, err := logrotate.NewFile(p)
+	if err != nil {
+		panic(errors.Wrap(err, "failed to open process log file"))
+	}
+
 	log.SetLevel(log.DebugLevel)
+	log.SetHandler(multi.New(
+		cli.Default,
+		cli.New(w.File, false),
+	))
+
+	log.WithField("path", p).Info("writing log files to disk")
 
 	return nil
 }
 
 // Prints the wings logo, nothing special here!
 func printLogo() {
-	fmt.Println()
-	fmt.Println(`                     ____`)
-	fmt.Println(`__ Pterodactyl _____/___/_______ _______ ______`)
-	fmt.Println(`\_____\    \/\/    /   /       /  __   /   ___/`)
-	fmt.Println(`   \___\          /   /   /   /  /_/  /___   /`)
-	fmt.Println(`        \___/\___/___/___/___/___    /______/`)
-	fmt.Println(`                            /_______/ v` + system.Version)
-	fmt.Println()
-	fmt.Println(`Website: https://pterodactyl.io`)
-	fmt.Println(`Source: https://github.com/pterodactyl/wings`)
-	fmt.Println()
-	fmt.Println(`Copyright © 2018 - 2020 Dane Everitt & Contributors`)
-	fmt.Println()
+	fmt.Printf(colorstring.Color(`
+                     ____
+__ [blue][bold]Pterodactyl[reset] _____/___/_______ _______ ______
+\_____\    \/\/    /   /       /  __   /   ___/
+   \___\          /   /   /   /  /_/  /___   /
+        \___/\___/___/___/___/___    /______/
+                            /_______/ [bold]v%s[reset]
+
+Copyright © 2018 - 2020 Dane Everitt & Contributors
+
+Website:  https://pterodactyl.io
+ Source:  https://github.com/pterodactyl/wings
+License:  https://github.com/pterodactyl/wings/blob/develop/LICENSE
+
+This software is made available under the terms of the MIT license.
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.%s`), system.Version, "\n\n")
 }
 
 func exitWithConfigurationNotice() {

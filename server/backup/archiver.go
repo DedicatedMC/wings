@@ -5,10 +5,12 @@ import (
 	"context"
 	"github.com/apex/log"
 	gzip "github.com/klauspost/pgzip"
+	"github.com/pkg/errors"
 	"github.com/remeh/sizedwaitgroup"
 	"golang.org/x/sync/errgroup"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -24,14 +26,23 @@ type Archive struct {
 func (a *Archive) Create(dst string, ctx context.Context) (os.FileInfo, error) {
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	defer f.Close()
 
-	gzw := gzip.NewWriter(f)
+	maxCpu := runtime.NumCPU() / 2
+	if maxCpu > 4 {
+		maxCpu = 4
+	}
+
+	gzw, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	_ = gzw.SetConcurrency(1 << 20, maxCpu)
+
+	defer gzw.Flush()
 	defer gzw.Close()
 
 	tw := tar.NewWriter(gzw)
+	defer tw.Flush()
 	defer tw.Close()
 
 	wg := sizedwaitgroup.New(10)
@@ -39,23 +50,17 @@ func (a *Archive) Create(dst string, ctx context.Context) (os.FileInfo, error) {
 	// Iterate over all of the files to be included and put them into the archive. This is
 	// done as a concurrent goroutine to speed things along. If an error is encountered at
 	// any step, the entire process is aborted.
-	for p, s := range a.Files.All() {
-		if (*s).IsDir() {
-			continue
-		}
-
-		pa := p
-		st := s
-
+	for _, p := range a.Files.All() {
+		p := p
 		g.Go(func() error {
 			wg.Add()
 			defer wg.Done()
 
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return errors.WithStack(ctx.Err())
 			default:
-				return a.addToArchive(pa, st, tw)
+				return a.addToArchive(p, tw)
 			}
 		})
 	}
@@ -70,33 +75,48 @@ func (a *Archive) Create(dst string, ctx context.Context) (os.FileInfo, error) {
 			log.WithField("location", dst).Warn("failed to delete corrupted backup archive")
 		}
 
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	st, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	return st, nil
 }
 
 // Adds a single file to the existing tar archive writer.
-func (a *Archive) addToArchive(p string, s *os.FileInfo, w *tar.Writer) error {
+func (a *Archive) addToArchive(p string, w *tar.Writer) error {
 	f, err := os.Open(p)
 	if err != nil {
-		return err
+		// If you try to backup something that no longer exists (got deleted somewhere during the process
+		// but not by this process), just skip over it and don't kill the entire backup.
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return errors.WithStack(err)
 	}
 	defer f.Close()
 
-	st := *s
+	s, err := f.Stat()
+	if err != nil {
+		// Same as above, don't kill the process just because the file no longer exists.
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return errors.WithStack(err)
+	}
+
 	header := &tar.Header{
 		// Trim the long server path from the name of the file so that the resulting
 		// archive is exactly how the user would see it in the panel file manager.
 		Name:    strings.TrimPrefix(p, a.TrimPrefix),
-		Size:    st.Size(),
-		Mode:    int64(st.Mode()),
-		ModTime: st.ModTime(),
+		Size:    s.Size(),
+		Mode:    int64(s.Mode()),
+		ModTime: s.ModTime(),
 	}
 
 	// These actions must occur sequentially, even if this function is called multiple
@@ -105,11 +125,12 @@ func (a *Archive) addToArchive(p string, s *os.FileInfo, w *tar.Writer) error {
 	defer a.Unlock()
 
 	if err := w.WriteHeader(header); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
-	if _, err := io.Copy(w, f); err != nil {
-		return err
+	buf := make([]byte, 4*1024)
+	if _, err := io.CopyBuffer(w, f, buf); err != nil {
+		return errors.WithStack(err)
 	}
 
 	return nil

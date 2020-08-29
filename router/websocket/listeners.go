@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"github.com/pterodactyl/wings/events"
 	"github.com/pterodactyl/wings/server"
 	"time"
 )
@@ -26,9 +27,9 @@ func (h *Handler) ListenForExpiration(ctx context.Context) {
 			jwt := h.GetJwt()
 			if jwt != nil {
 				if jwt.ExpirationTime.Unix()-time.Now().Unix() <= 0 {
-					h.SendJson(&Message{Event: TokenExpiredEvent})
+					_ = h.SendJson(&Message{Event: TokenExpiredEvent})
 				} else if jwt.ExpirationTime.Unix()-time.Now().Unix() <= 180 {
-					h.SendJson(&Message{Event: TokenExpiringEvent})
+					_ = h.SendJson(&Message{Event: TokenExpiringEvent})
 				}
 			}
 		}
@@ -38,31 +39,32 @@ func (h *Handler) ListenForExpiration(ctx context.Context) {
 // Listens for different events happening on a server and sends them along
 // to the connected websocket.
 func (h *Handler) ListenForServerEvents(ctx context.Context) {
-	events := []string{
+	e := []string{
 		server.StatsEvent,
 		server.StatusEvent,
 		server.ConsoleOutputEvent,
 		server.InstallOutputEvent,
+		server.InstallStartedEvent,
+		server.InstallCompletedEvent,
 		server.DaemonMessageEvent,
 		server.BackupCompletedEvent,
 	}
 
-	eventChannel := make(chan server.Event)
-	for _, event := range events {
+	eventChannel := make(chan events.Event)
+	for _, event := range e {
 		h.server.Events().Subscribe(event, eventChannel)
 	}
 
-	select {
-	case <-ctx.Done():
-		for _, event := range events {
-			h.server.Events().Unsubscribe(event, eventChannel)
-		}
+	for d := range eventChannel {
+		select {
+		case <-ctx.Done():
+			for _, event := range e {
+				h.server.Events().Unsubscribe(event, eventChannel)
+			}
 
-		close(eventChannel)
-	default:
-		// Listen for different events emitted by the server and respond to them appropriately.
-		for d := range eventChannel {
-			h.SendJson(&Message{
+			close(eventChannel)
+		default:
+			_ = h.SendJson(&Message{
 				Event: d.Topic,
 				Args:  []string{d.Data},
 			})

@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"context"
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+	"github.com/pterodactyl/wings/router/tokens"
 	"github.com/pterodactyl/wings/server"
 	"golang.org/x/sync/errgroup"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -129,7 +133,17 @@ func putServerRenameFiles(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				return s.Filesystem.Rename(pf, pt)
+				if err := s.Filesystem.Rename(pf, pt); err != nil {
+					// Return nil if the error is an is not exists.
+					// NOTE: os.IsNotExist() does not work if the error is wrapped.
+					if errors.Is(err, os.ErrNotExist) {
+						return nil
+					}
+
+					return err
+				}
+
+				return nil
 			}
 		})
 	}
@@ -155,6 +169,13 @@ func postServerCopyFile(c *gin.Context) {
 	}
 
 	if err := s.Filesystem.Copy(data.Location); err != nil {
+		// Check if the file does not exist.
+		// NOTE: os.IsNotExist() does not work if the error is wrapped.
+		if errors.Is(err, os.ErrNotExist) {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
 		TrackedServerError(err, s).AbortWithServerError(c)
 		return
 	}
@@ -177,7 +198,7 @@ func postServerDeleteFiles(c *gin.Context) {
 
 	if len(data.Files) == 0 {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
-			"error": "No files were specififed for deletion.",
+			"error": "No files were specified for deletion.",
 		})
 		return
 	}
@@ -311,9 +332,86 @@ func postServerDecompressFiles(c *gin.Context) {
 	}
 
 	if err := s.Filesystem.DecompressFile(data.RootPath, data.File); err != nil {
+		// Check if the file does not exist.
+		// NOTE: os.IsNotExist() does not work if the error is wrapped.
+		if errors.Is(err, os.ErrNotExist) {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
 		TrackedServerError(err, s).AbortWithServerError(c)
 		return
 	}
 
 	c.Status(http.StatusNoContent)
+}
+
+func postServerUploadFiles(c *gin.Context) {
+	token := tokens.UploadPayload{}
+	if err := tokens.ParseToken([]byte(c.Query("token")), &token); err != nil {
+		TrackedError(err).AbortWithServerError(c)
+		return
+	}
+
+	s := GetServer(token.ServerUuid)
+	if s == nil || !token.IsUniqueRequest() {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"error": "The requested resource was not found on this server.",
+		})
+		return
+	}
+
+	if !s.Filesystem.HasSpaceAvailable() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "This server does not have enough available disk space to accept any file uploads.",
+		})
+		return
+	}
+
+	form, err := c.MultipartForm()
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "Failed to get multipart form.",
+		})
+		return
+	}
+
+	headers, ok := form.File["files"]
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusNotModified, gin.H{
+			"error": "No files were attached to the request.",
+		})
+		return
+	}
+
+	directory := c.Query("directory")
+
+	for _, header := range headers {
+		p, err := s.Filesystem.SafePath(filepath.Join(directory, header.Filename))
+		if err != nil {
+			c.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+
+		// We run this in a different method so I can use defer without any of
+		// the consequences caused by calling it in a loop.
+		if err := handleFileUpload(p, s, header); err != nil {
+			c.AbortWithError(http.StatusInternalServerError, err)
+			return
+		}
+	}
+}
+
+func handleFileUpload(p string, s *server.Server, header *multipart.FileHeader) error {
+	file, err := header.Open()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer file.Close()
+
+	if err := s.Filesystem.Writefile(p, file); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
 }
