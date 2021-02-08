@@ -2,11 +2,11 @@ package docker
 
 import (
 	"context"
+	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/api"
 	"github.com/pterodactyl/wings/environment"
 	"os"
@@ -20,13 +20,12 @@ import (
 //
 // This process will also confirm that the server environment exists and is in a bootable
 // state. This ensures that unexpected container deletion while Wings is running does
-// not result in the server becoming unbootable.
+// not result in the server becoming un-bootable.
 func (e *Environment) OnBeforeStart() error {
-	// Always destroy and re-create the server container to ensure that synced data from
-	// the Panel is usee.
+	// Always destroy and re-create the server container to ensure that synced data from the Panel is used.
 	if err := e.client.ContainerRemove(context.Background(), e.Id, types.ContainerRemoveOptions{RemoveVolumes: true}); err != nil {
 		if !client.IsErrNotFound(err) {
-			return errors.Wrap(err, "failed to remove server docker container during pre-boot")
+			return errors.WithMessage(err, "failed to remove server docker container during pre-boot")
 		}
 	}
 
@@ -35,7 +34,7 @@ func (e *Environment) OnBeforeStart() error {
 	// container and data storage directory.
 	//
 	// This won't actually run an installation process however, it is just here to ensure the
-	// environment gets created properly if it is missing and the server is startee. We're making
+	// environment gets created properly if it is missing and the server is started. We're making
 	// an assumption that all of the files will still exist at this point.
 	if err := e.Create(); err != nil {
 		return err
@@ -49,6 +48,7 @@ func (e *Environment) OnBeforeStart() error {
 // call to OnBeforeStart().
 func (e *Environment) Start() error {
 	sawError := false
+
 	// If sawError is set to true there was an error somewhere in the pipeline that
 	// got passed up, but we also want to ensure we set the server to be offline at
 	// that point.
@@ -57,24 +57,24 @@ func (e *Environment) Start() error {
 			// If we don't set it to stopping first, you'll trigger crash detection which
 			// we don't want to do at this point since it'll just immediately try to do the
 			// exact same action that lead to it crashing in the first place...
-			e.setState(environment.ProcessStoppingState)
-			e.setState(environment.ProcessOfflineState)
+			e.SetState(environment.ProcessStoppingState)
+			e.SetState(environment.ProcessOfflineState)
 		}
 	}()
 
 	if c, err := e.client.ContainerInspect(context.Background(), e.Id); err != nil {
 		// Do nothing if the container is not found, we just don't want to continue
-		// to the next block of code here. This check was inlined here to guard againt
+		// to the next block of code here. This check was inlined here to guard against
 		// a nil-pointer when checking c.State below.
 		//
 		// @see https://github.com/pterodactyl/panel/issues/2000
 		if !client.IsErrNotFound(err) {
-			return errors.WithStack(err)
+			return err
 		}
 	} else {
 		// If the server is running update our internal state and continue on with the attach.
 		if c.State.Running {
-			e.setState(environment.ProcessRunningState)
+			e.SetState(environment.ProcessRunningState)
 
 			return e.Attach()
 		}
@@ -84,12 +84,12 @@ func (e *Environment) Start() error {
 		// to truncate them.
 		if _, err := os.Stat(c.LogPath); err == nil {
 			if err := os.Truncate(c.LogPath, 0); err != nil {
-				return errors.WithStack(err)
+				return err
 			}
 		}
 	}
 
-	e.setState(environment.ProcessStartingState)
+	e.SetState(environment.ProcessStartingState)
 
 	// Set this to true for now, we will set it to false once we reach the
 	// end of this chain.
@@ -99,14 +99,14 @@ func (e *Environment) Start() error {
 	// exists on the system, and rebuild the container if that is required for server booting to
 	// occur.
 	if err := e.OnBeforeStart(); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
 	if err := e.client.ContainerStart(ctx, e.Id, types.ContainerStartOptions{}); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	// No errors, good to continue through.
@@ -126,9 +126,9 @@ func (e *Environment) Stop() error {
 	s := e.meta.Stop
 	e.mu.RUnlock()
 
-	if s == nil || s.Type == api.ProcessStopSignal {
-		if s == nil {
-			log.WithField("container_id", e.Id).Warn("no stop configuration detected for environment, using termination proceedure")
+	if s.Type == "" || s.Type == api.ProcessStopSignal {
+		if s.Type == "" {
+			log.WithField("container_id", e.Id).Warn("no stop configuration detected for environment, using termination procedure")
 		}
 
 		return e.Terminate(os.Kill)
@@ -136,8 +136,8 @@ func (e *Environment) Stop() error {
 
 	// If the process is already offline don't switch it back to stopping. Just leave it how
 	// it is and continue through to the stop handling for the process.
-	if e.State() != environment.ProcessOfflineState {
-		e.setState(environment.ProcessStoppingState)
+	if e.st.Load() != environment.ProcessOfflineState {
+		e.SetState(environment.ProcessStoppingState)
 	}
 
 	// Only attempt to send the stop command to the instance if we are actually attached to
@@ -147,13 +147,13 @@ func (e *Environment) Stop() error {
 	}
 
 	t := time.Second * 30
-	err := e.client.ContainerStop(context.Background(), e.Id, &t)
-	if err != nil {
+
+	if err := e.client.ContainerStop(context.Background(), e.Id, &t); err != nil {
 		// If the container does not exist just mark the process as stopped and return without
 		// an error.
 		if client.IsErrNotFound(err) {
 			e.SetStream(nil)
-			e.setState(environment.ProcessOfflineState)
+			e.SetState(environment.ProcessOfflineState)
 
 			return nil
 		}
@@ -169,7 +169,7 @@ func (e *Environment) Stop() error {
 // will be terminated forcefully depending on the value of the second argument.
 func (e *Environment) WaitForStop(seconds uint, terminate bool) error {
 	if err := e.Stop(); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
@@ -183,14 +183,27 @@ func (e *Environment) WaitForStop(seconds uint, terminate bool) error {
 	case <-ctx.Done():
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if terminate {
+				log.WithField("container_id", e.Id).Info("server did not stop in time, executing process termination")
+
 				return e.Terminate(os.Kill)
 			}
 
-			return errors.WithStack(ctxErr)
+			return ctxErr
 		}
 	case err := <-errChan:
 		if err != nil {
-			return errors.WithStack(err)
+			if terminate {
+				l := log.WithField("container_id", e.Id)
+				if errors.Is(err, context.DeadlineExceeded) {
+					l.Warn("deadline exceeded for container stop; terminating process")
+				} else {
+					l.WithField("error", err).Warn("error while waiting for container stop; terminating process")
+				}
+
+				return e.Terminate(os.Kill)
+			}
+
+			return err
 		}
 	case <-ok:
 	}
@@ -202,31 +215,31 @@ func (e *Environment) WaitForStop(seconds uint, terminate bool) error {
 func (e *Environment) Terminate(signal os.Signal) error {
 	c, err := e.client.ContainerInspect(context.Background(), e.Id)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	if !c.State.Running {
 		// If the container is not running but we're not already in a stopped state go ahead
 		// and update things to indicate we should be completely stopped now. Set to stopping
 		// first so crash detection is not triggered.
-		if e.State() != environment.ProcessOfflineState {
-			e.setState(environment.ProcessStoppingState)
-			e.setState(environment.ProcessOfflineState)
+		if e.st.Load() != environment.ProcessOfflineState {
+			e.SetState(environment.ProcessStoppingState)
+			e.SetState(environment.ProcessOfflineState)
 		}
 
 		return nil
 	}
 
-	// We set it to stopping than offline to prevent crash detection from being triggeree.
-	e.setState(environment.ProcessStoppingState)
+	// We set it to stopping than offline to prevent crash detection from being triggered.
+	e.SetState(environment.ProcessStoppingState)
 
 	sig := strings.TrimSuffix(strings.TrimPrefix(signal.String(), "signal "), "ed")
 
-	if err := e.client.ContainerKill(context.Background(), e.Id, sig); err != nil {
+	if err := e.client.ContainerKill(context.Background(), e.Id, sig); err != nil && !client.IsErrNotFound(err) {
 		return err
 	}
 
-	e.setState(environment.ProcessOfflineState)
+	e.SetState(environment.ProcessOfflineState)
 
 	return nil
 }

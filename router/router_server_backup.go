@@ -1,12 +1,14 @@
 package router
 
 import (
-	"errors"
 	"fmt"
+	"net/http"
+	"os"
+
+	"emperror.dev/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/pterodactyl/wings/server"
 	"github.com/pterodactyl/wings/server/backup"
-	"net/http"
 )
 
 // Backs up a server.
@@ -33,32 +35,52 @@ func postServerBackup(c *gin.Context) {
 	}
 
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
+	// Attach the server ID to the backup log output for easier parsing.
+	adapter.WithLogContext(map[string]interface{}{
+		"server": s.Id(),
+	})
+
 	go func(b backup.BackupInterface, serv *server.Server) {
 		if err := serv.Backup(b); err != nil {
-			serv.Log().WithField("error", err).Error("failed to generate backup for server")
+			serv.Log().WithField("error", errors.WithStackIf(err)).Error("failed to generate backup for server")
 		}
 	}(adapter, s)
 
 	c.Status(http.StatusAccepted)
 }
 
-// Deletes a local backup of a server.
+// Deletes a local backup of a server. If the backup is not found on the machine just return
+// a 404 error. The service calling this endpoint can make its own decisions as to how it wants
+// to handle that response.
 func deleteServerBackup(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
 	b, _, err := backup.LocateLocal(c.Param("backup"))
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		// Just return from the function at this point if the backup was not located.
+		if errors.Is(err, os.ErrNotExist) {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+				"error": "The requested backup was not found on this server.",
+			})
+			return
+		}
+
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
 	if err := b.Remove(); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
-		return
+		// I'm not entirely sure how likely this is to happen, however if we did manage to locate
+		// the backup previously and it is now missing when we go to delete, just treat it as having
+		// been successful, rather than returning a 404.
+		if !errors.Is(err, os.ErrNotExist) {
+			NewServerError(err, s).Abort(c)
+			return
+		}
 	}
 
 	c.Status(http.StatusNoContent)

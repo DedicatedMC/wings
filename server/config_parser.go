@@ -1,8 +1,9 @@
 package server
 
 import (
-	"github.com/gammazero/workerpool"
 	"runtime"
+
+	"github.com/gammazero/workerpool"
 )
 
 // Parent function that will update all of the defined configuration files for a server
@@ -15,7 +16,7 @@ func (s *Server) UpdateConfigurationFiles() {
 		f := cf
 
 		pool.Submit(func() {
-			p, err := s.Filesystem.SafePath(f.FileName)
+			p, err := s.Filesystem().SafePath(f.FileName)
 			if err != nil {
 				s.Log().WithField("error", err).Error("failed to generate safe path for configuration file")
 

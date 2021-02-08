@@ -2,72 +2,69 @@ package docker
 
 import (
 	"context"
+	"emperror.dev/errors"
 	"encoding/json"
-	"github.com/apex/log"
 	"github.com/docker/docker/api/types"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/environment"
 	"io"
 	"math"
-	"sync/atomic"
 )
 
 // Attach to the instance and then automatically emit an event whenever the resource usage for the
 // server process changes.
 func (e *Environment) pollResources(ctx context.Context) error {
-	if e.State() == environment.ProcessOfflineState {
-		return errors.New("attempting to enable resource polling on a stopped server instance")
+	if e.st.Load() == environment.ProcessOfflineState {
+		return errors.New("cannot enable resource polling on a stopped server")
 	}
 
-	stats, err := e.client.ContainerStats(context.Background(), e.Id, true)
+	e.log().Info("starting resource polling for container")
+	defer e.log().Debug("stopped resource polling for container")
+
+	stats, err := e.client.ContainerStats(ctx, e.Id, true)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
+	defer stats.Body.Close()
 
 	dec := json.NewDecoder(stats.Body)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			var v *types.StatsJSON
-
+			var v types.StatsJSON
 			if err := dec.Decode(&v); err != nil {
-				if err != io.EOF {
-					log.WithField("container_id", e.Id).Warn("encountered error processing docker stats output, stopping collection")
+				if err != io.EOF && !errors.Is(err, context.Canceled) {
+					e.log().WithField("error", err).Warn("error while processing Docker stats output for container")
+				} else {
+					e.log().Debug("io.EOF encountered during stats decode, stopping polling...")
 				}
-
 				return nil
 			}
 
 			// Disable collection if the server is in an offline state and this process is still running.
-			if e.State() == environment.ProcessOfflineState {
+			if e.st.Load() == environment.ProcessOfflineState {
+				e.log().Debug("process in offline state while resource polling is still active; stopping poll")
 				return nil
 			}
 
-			var rx uint64
-			var tx uint64
-			for _, nw := range v.Networks {
-				atomic.AddUint64(&rx, nw.RxBytes)
-				atomic.AddUint64(&tx, nw.RxBytes)
-			}
-
-			st := &environment.Stats{
+			st := environment.Stats{
 				Memory:      calculateDockerMemory(v.MemoryStats),
 				MemoryLimit: v.MemoryStats.Limit,
-				CpuAbsolute: calculateDockerAbsoluteCpu(&v.PreCPUStats, &v.CPUStats),
-				Network: struct {
-					RxBytes uint64 `json:"rx_bytes"`
-					TxBytes uint64 `json:"tx_bytes"`
-				}{
-					RxBytes: rx,
-					TxBytes: tx,
-				},
+				CpuAbsolute: calculateDockerAbsoluteCpu(v.PreCPUStats, v.CPUStats),
+				Network:     environment.NetworkStats{},
 			}
 
-			b, _ := json.Marshal(st)
-			e.Events().Publish(environment.ResourceEvent, string(b))
+			for _, nw := range v.Networks {
+				st.Network.RxBytes += nw.RxBytes
+				st.Network.TxBytes += nw.TxBytes
+			}
+
+			if b, err := json.Marshal(st); err != nil {
+				e.log().WithField("error", err).Warn("error while marshaling stats object for environment")
+			} else {
+				e.Events().Publish(environment.ResourceEvent, string(b))
+			}
 		}
 	}
 }
@@ -97,7 +94,7 @@ func calculateDockerMemory(stats types.MemoryStats) uint64 {
 // by the defined CPU limits on the container.
 //
 // @see https://github.com/docker/cli/blob/aa097cf1aa19099da70930460250797c8920b709/cli/command/container/stats_helpers.go#L166
-func calculateDockerAbsoluteCpu(pStats *types.CPUStats, stats *types.CPUStats) float64 {
+func calculateDockerAbsoluteCpu(pStats types.CPUStats, stats types.CPUStats) float64 {
 	// Calculate the change in CPU usage between the current and previous reading.
 	cpuDelta := float64(stats.CPUUsage.TotalUsage) - float64(pStats.CPUUsage.TotalUsage)
 

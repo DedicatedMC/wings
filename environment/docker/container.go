@@ -3,6 +3,8 @@ package docker
 import (
 	"bufio"
 	"context"
+	"emperror.dev/errors"
+	"encoding/json"
 	"fmt"
 	"github.com/apex/log"
 	"github.com/docker/docker/api/types"
@@ -10,26 +12,47 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/daemon/logger/jsonfilelog"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
+	"github.com/pterodactyl/wings/system"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 )
 
+type imagePullStatus struct {
+	Status   string `json:"status"`
+	Progress string `json:"progress"`
+}
+
+// A custom console writer that allows us to keep a function blocked until the
+// given stream is properly closed. This does nothing special, only exists to
+// make a noop io.Writer.
+type noopWriter struct{}
+
+var _ io.Writer = noopWriter{}
+
+// Implement the required Write function to satisfy the io.Writer interface.
+func (nw noopWriter) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
 // Attaches to the docker container itself and ensures that we can pipe data in and out
 // of the process stream. This should not be used for reading console data as you *will*
 // miss important output at the beginning because of the time delay with attaching to the
 // output.
+//
+// Calling this function will poll resources for the container in the background until the
+// provided context is canceled by the caller. Failure to cancel said context will cause
+// background memory leaks as the goroutine will not exit.
 func (e *Environment) Attach() error {
 	if e.IsAttached() {
 		return nil
 	}
 
 	if err := e.followOutput(); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	opts := types.ContainerAttachOptions{
@@ -41,32 +64,46 @@ func (e *Environment) Attach() error {
 
 	// Set the stream again with the container.
 	if st, err := e.client.ContainerAttach(context.Background(), e.Id, opts); err != nil {
-		return errors.WithStack(err)
+		return err
 	} else {
 		e.SetStream(&st)
 	}
 
-	c := new(Console)
-	go func(console *Console) {
+	go func() {
 		ctx, cancel := context.WithCancel(context.Background())
-
 		defer cancel()
 		defer e.stream.Close()
 		defer func() {
-			e.setState(environment.ProcessOfflineState)
+			e.SetState(environment.ProcessOfflineState)
 			e.SetStream(nil)
 		}()
 
-		// Poll resources in a seperate thread since this will block the copy call below
-		// from being reached until it is completed if not run in a seperate process. However,
-		// we still want it to be stopped when the copy operation below is finished running which
-		// indicates that the container is no longer running.
-		go e.pollResources(ctx)
+		go func() {
+			if err := e.pollResources(ctx); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					e.log().WithField("error", err).Error("error during environment resource polling")
+				} else {
+					e.log().Warn("stopping server resource polling: context canceled")
+				}
+			}
+		}()
 
-		// Stream the reader output to the console which will then fire off events and handle console
-		// throttling and sending the output to the user.
-		_, _ = io.Copy(console, e.stream.Reader)
-	}(c)
+		// Block the completion of this routine until the container is no longer running. This allows
+		// the pollResources function to run until it needs to be stopped. Because the container
+		// can be polled for resource usage, even when stopped, we need to have this logic present
+		// in order to cancel the context and therefore stop the routine that is spawned.
+		//
+		// For now, DO NOT use client#ContainerWait from the Docker package. There is a nasty
+		// bug causing containers to hang on deletion and cause servers to lock up on the system.
+		//
+		// This weird code isn't intuitive, but it keeps the function from ending until the container
+		// is stopped and therefore the stream reader ends up closed.
+		// @see https://github.com/moby/moby/issues/41827
+		c := new(noopWriter)
+		if _, err := io.Copy(c, e.stream.Reader); err != nil {
+			e.log().WithField("error", err).Error("could not copy from environment stream to noop writer")
+		}
+	}()
 
 	return nil
 }
@@ -102,7 +139,7 @@ func (e *Environment) InSituUpdate() error {
 			return nil
 		}
 
-		return errors.WithStack(err)
+		return err
 	}
 
 	u := container.UpdateConfig{
@@ -112,7 +149,7 @@ func (e *Environment) InSituUpdate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 	if _, err := e.client.ContainerUpdate(ctx, e.Id, u); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	return nil
@@ -127,15 +164,24 @@ func (e *Environment) Create() error {
 	if _, err := e.client.ContainerInspect(context.Background(), e.Id); err == nil {
 		return nil
 	} else if !client.IsErrNotFound(err) {
-		return errors.WithStack(err)
+		return err
 	}
 
 	// Try to pull the requested image before creating the container.
 	if err := e.ensureImageExists(e.meta.Image); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	a := e.Configuration.Allocations()
+
+	evs := e.Configuration.EnvironmentVariables()
+	for i, v := range evs {
+		// Convert 127.0.0.1 to the pterodactyl0 network interface if the environment is Docker
+		// so that the server operates as expected.
+		if v == "SERVER_IP=127.0.0.1" {
+			evs[i] = "SERVER_IP=" + config.Get().Docker.Network.Interface
+		}
+	}
 
 	conf := &container.Config{
 		Hostname:     e.Id,
@@ -158,16 +204,16 @@ func (e *Environment) Create() error {
 	tmpfsSize := strconv.Itoa(int(config.Get().Docker.TmpfsSize))
 
 	hostConf := &container.HostConfig{
-		PortBindings: a.Bindings(),
+		PortBindings: a.DockerBindings(),
 
 		// Configure the mounts for this container. First mount the server data directory
-		// into the container as a r/w bine.
+		// into the container as a r/w bind.
 		Mounts: e.convertMounts(),
 
 		// Configure the /tmp folder mapping in containers. This is necessary for some
 		// games that need to make use of it for downloads and other installation processes.
 		Tmpfs: map[string]string{
-			"/tmp": "rw,exec,nosuid,size="+tmpfsSize+"M",
+			"/tmp": "rw,exec,nosuid,size=" + tmpfsSize + "M",
 		},
 
 		// Define resource limits for the container based on the data passed through
@@ -185,6 +231,7 @@ func (e *Environment) Create() error {
 			Config: map[string]string{
 				"max-size": "5m",
 				"max-file": "1",
+				"compress": "false",
 			},
 		},
 
@@ -197,8 +244,8 @@ func (e *Environment) Create() error {
 		NetworkMode: container.NetworkMode(config.Get().Docker.Network.Mode),
 	}
 
-	if _, err := e.client.ContainerCreate(context.Background(), conf, hostConf, nil, e.Id); err != nil {
-		return errors.WithStack(err)
+	if _, err := e.client.ContainerCreate(context.Background(), conf, hostConf, nil, nil, e.Id); err != nil {
+		return err
 	}
 
 	return nil
@@ -222,14 +269,16 @@ func (e *Environment) convertMounts() []mount.Mount {
 // Remove the Docker container from the machine. If the container is currently running
 // it will be forcibly stopped by Docker.
 func (e *Environment) Destroy() error {
-	// We set it to stopping than offline to prevent crash detection from being triggeree.
-	e.setState(environment.ProcessStoppingState)
+	// We set it to stopping than offline to prevent crash detection from being triggered.
+	e.SetState(environment.ProcessStoppingState)
 
 	err := e.client.ContainerRemove(context.Background(), e.Id, types.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		RemoveLinks:   false,
 		Force:         true,
 	})
+
+	e.SetState(environment.ProcessOfflineState)
 
 	// Don't trigger a destroy failure if we try to delete a container that does not
 	// exist on the system. We're just a step ahead of ourselves in that case.
@@ -239,20 +288,17 @@ func (e *Environment) Destroy() error {
 		return nil
 	}
 
-	e.setState(environment.ProcessOfflineState)
-
 	return err
 }
 
-// Attaches to the log for the container. This avoids us missing cruicial output that
+// Attaches to the log for the container. This avoids us missing crucial output that
 // happens in the split seconds before the code moves from 'Starting' to 'Attaching'
 // on the process.
 func (e *Environment) followOutput() error {
 	if exists, err := e.Exists(); !exists {
 		if err != nil {
-			return errors.WithStack(err)
+			return err
 		}
-
 		return errors.New(fmt.Sprintf("no such container: %s", e.Id))
 	}
 
@@ -264,21 +310,40 @@ func (e *Environment) followOutput() error {
 	}
 
 	reader, err := e.client.ContainerLogs(context.Background(), e.Id, opts)
+	if err != nil {
+		return err
+	}
 
-	go func(r io.ReadCloser) {
-		defer r.Close()
+	go e.scanOutput(reader)
 
-		s := bufio.NewScanner(r)
-		for s.Scan() {
-			e.Events().Publish(environment.ConsoleOutputEvent, s.Text())
-		}
+	return nil
+}
 
-		if err := s.Err(); err != nil {
-			log.WithField("error", err).WithField("container_id", e.Id).Warn("error processing scanner line in console output")
-		}
-	}(reader)
+func (e *Environment) scanOutput(reader io.ReadCloser) {
+	defer reader.Close()
 
-	return errors.WithStack(err)
+	events := e.Events()
+
+	err := system.ScanReader(reader, func(line string) {
+		events.Publish(environment.ConsoleOutputEvent, line)
+	})
+
+	if err != nil && err != io.EOF {
+		log.WithField("error", err).WithField("container_id", e.Id).Warn("error processing scanner line in console output")
+		return
+	}
+
+	// Return here if the server is offline or currently stopping.
+	if e.State() == environment.ProcessStoppingState || e.State() == environment.ProcessOfflineState {
+		return
+	}
+
+	// Close the current reader before starting a new one, the defer will still run
+	// but it will do nothing if we already closed the stream.
+	_ = reader.Close()
+
+	// Start following the output of the server again.
+	go e.followOutput()
 }
 
 // Pulls the image from Docker. If there is an error while pulling the image from the source
@@ -289,9 +354,15 @@ func (e *Environment) followOutput() error {
 // need to block all of the servers from booting just because of that. I'd imagine in a lot of
 // cases an outage shouldn't affect users too badly. It'll at least keep existing servers working
 // correctly if anything.
-//
-// TODO: handle authorization & local images
 func (e *Environment) ensureImageExists(image string) error {
+	e.Events().Publish(environment.DockerImagePullStarted, "")
+	defer e.Events().Publish(environment.DockerImagePullCompleted, "")
+
+	// Images prefixed with a ~ are local images that we do not need to try and pull.
+	if strings.HasPrefix(image, "~") {
+		return nil
+	}
+
 	// Give it up to 15 minutes to pull the image. I think this should cover 99.8% of cases where an
 	// image pull might fail. I can't imagine it will ever take more than 15 minutes to fully pull
 	// an image. Let me know when I am inevitably wrong here...
@@ -340,7 +411,7 @@ func (e *Environment) ensureImageExists(image string) error {
 				log.WithFields(log.Fields{
 					"image":        image,
 					"container_id": e.Id,
-					"error":        errors.New(err.Error()),
+					"err":          err.Error(),
 				}).Warn("unable to pull requested image from remote source, however the image exists locally")
 
 				// Okay, we found a matching container image, in that case just go ahead and return
@@ -356,15 +427,23 @@ func (e *Environment) ensureImageExists(image string) error {
 	log.WithField("image", image).Debug("pulling docker image... this could take a bit of time")
 
 	// I'm not sure what the best approach here is, but this will block execution until the image
-	// is done being pulled, which is what we neee.
+	// is done being pulled, which is what we need.
 	scanner := bufio.NewScanner(out)
+
 	for scanner.Scan() {
-		continue
+		s := imagePullStatus{}
+		fmt.Println(scanner.Text())
+
+		if err := json.Unmarshal(scanner.Bytes(), &s); err == nil {
+			e.Events().Publish(environment.DockerImagePullStatus, s.Status+" "+s.Progress)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+
+	log.WithField("image", image).Debug("completed docker image pull")
 
 	return nil
 }

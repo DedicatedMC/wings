@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/config"
-	"golang.org/x/sync/semaphore"
 	"os"
 	"time"
+
+	"emperror.dev/errors"
+	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/environment"
+	"golang.org/x/sync/semaphore"
 )
 
 type PowerAction string
@@ -37,6 +39,21 @@ func (pa PowerAction) IsStart() bool {
 	return pa == PowerActionStart || pa == PowerActionRestart
 }
 
+// Check if there is currently a power action being processed for the server.
+func (s *Server) ExecutingPowerAction() bool {
+	if s.powerLock == nil {
+		return false
+	}
+
+	ok := s.powerLock.TryAcquire(1)
+	if ok {
+		s.powerLock.Release(1)
+	}
+
+	// Remember, if we acquired a lock it means nothing was running.
+	return !ok
+}
+
 // Helper function that can receive a power action and then process the actions that need
 // to occur for it. This guards against someone calling Start() twice at the same time, or
 // trying to restart while another restart process is currently running.
@@ -45,6 +62,14 @@ func (pa PowerAction) IsStart() bool {
 // function rather than making direct calls to the start/stop/restart functions on the
 // environment struct.
 func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error {
+	if s.IsInstalling() {
+		return ErrServerIsInstalling
+	}
+
+	if s.IsTransferring() {
+		return ErrServerIsTransferring
+	}
+
 	if s.powerLock == nil {
 		s.powerLock = semaphore.NewWeighted(1)
 	}
@@ -63,13 +88,13 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 			// time than that passes an error will be propagated back up the chain and this
 			// request will be aborted.
 			if err := s.powerLock.Acquire(ctx, 1); err != nil {
-				return errors.Wrap(err, "could not acquire lock on power state")
+				return errors.WithMessage(err, "could not acquire lock on power state")
 			}
 		} else {
 			// If no wait duration was provided we will attempt to immediately acquire the lock
 			// and bail out with a context deadline error if it is not acquired immediately.
 			if ok := s.powerLock.TryAcquire(1); !ok {
-				return errors.Wrap(context.DeadlineExceeded, "could not acquire lock on power state")
+				return errors.WithMessage(context.DeadlineExceeded, "could not acquire lock on power state")
 			}
 		}
 
@@ -87,6 +112,10 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 
 	switch action {
 	case PowerActionStart:
+		if s.Environment.State() != environment.ProcessOfflineState {
+			return ErrIsRunning
+		}
+
 		// Run the pre-boot logic for the server before processing the environment start.
 		if err := s.onBeforeStart(); err != nil {
 			return err
@@ -94,7 +123,7 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 
 		return s.Environment.Start()
 	case PowerActionStop:
-		// We're specificially waiting for the process to be stopped here, otherwise the lock is released
+		// We're specifically waiting for the process to be stopped here, otherwise the lock is released
 		// too soon, and you can rack up all sorts of issues.
 		return s.Environment.WaitForStop(10*60, true)
 	case PowerActionRestart:
@@ -128,26 +157,33 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 func (s *Server) onBeforeStart() error {
 	s.Log().Info("syncing server configuration with panel")
 	if err := s.Sync(); err != nil {
-		return errors.Wrap(err, "unable to sync server data from Panel instance")
+		return errors.WithMessage(err, "unable to sync server data from Panel instance")
 	}
 
 	// Disallow start & restart if the server is suspended. Do this check after performing a sync
 	// action with the Panel to ensure that we have the most up-to-date information for that server.
 	if s.IsSuspended() {
-		return new(suspendedError)
+		return ErrSuspended
 	}
 
 	// Ensure we sync the server information with the environment so that any new environment variables
 	// and process resource limits are correctly applied.
 	s.SyncWithEnvironment()
 
-	if !s.Filesystem.HasSpaceAvailable() {
-		return errors.New("cannot start server, not enough disk space available")
+	// If a server has unlimited disk space, we don't care enough to block the startup to check remaining.
+	// However, we should trigger a size anyway, as it'd be good to kick it off for other processes.
+	if s.DiskSpace() <= 0 {
+		s.Filesystem().HasSpaceAvailable(true)
+	} else {
+		s.PublishConsoleOutputFromDaemon("Checking server disk space usage, this could take a few seconds...")
+		if err := s.Filesystem().HasSpaceErr(false); err != nil {
+			return err
+		}
 	}
 
 	// Update the configuration files defined for the server before beginning the boot process.
 	// This process executes a bunch of parallel updates, so we just block until that process
-	// is completee. Any errors as a result of this will just be bubbled out in the logger,
+	// is complete. Any errors as a result of this will just be bubbled out in the logger,
 	// we don't need to actively do anything about it at this point, worst comes to worst the
 	// server starts in a weird state and the user can manually adjust.
 	s.PublishConsoleOutputFromDaemon("Updating process configuration files...")
@@ -156,8 +192,8 @@ func (s *Server) onBeforeStart() error {
 	if config.Get().System.CheckPermissionsOnBoot {
 		s.PublishConsoleOutputFromDaemon("Ensuring file permissions are set correctly, this could take a few seconds...")
 		// Ensure all of the server file permissions are set correctly before booting the process.
-		if err := s.Filesystem.Chown("/"); err != nil {
-			return errors.Wrap(err, "failed to chown root server directory during pre-boot process")
+		if err := s.Filesystem().Chown("/"); err != nil {
+			return errors.WithMessage(err, "failed to chown root server directory during pre-boot process")
 		}
 	}
 

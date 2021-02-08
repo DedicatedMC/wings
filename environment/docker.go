@@ -2,6 +2,9 @@ package environment
 
 import (
 	"context"
+	"strconv"
+	"sync"
+
 	"github.com/apex/log"
 
 	"github.com/docker/docker/api/types"
@@ -10,10 +13,28 @@ import (
 	"github.com/pterodactyl/wings/config"
 )
 
+var _cmu sync.Mutex
+var _client *client.Client
+
+// Return a Docker client to be used throughout the codebase. Once a client has been created it
+// will be returned for all subsequent calls to this function.
+func DockerClient() (*client.Client, error) {
+	_cmu.Lock()
+	defer _cmu.Unlock()
+
+	if _client != nil {
+		return _client, nil
+	}
+
+	_client, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+
+	return _client, err
+}
+
 // Configures the required network for the docker environment.
 func ConfigureDocker(c *config.DockerConfiguration) error {
 	// Ensure the required docker network exists on the system.
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	cli, err := DockerClient()
 	if err != nil {
 		return err
 	}
@@ -64,7 +85,7 @@ func createDockerNetwork(cli *client.Client, c *config.DockerConfiguration) erro
 		Options: map[string]string{
 			"encryption": "false",
 			"com.docker.network.bridge.default_bridge":       "false",
-			"com.docker.network.bridge.enable_icc":           "true",
+			"com.docker.network.bridge.enable_icc":           strconv.FormatBool(c.Network.EnableICC),
 			"com.docker.network.bridge.enable_ip_masquerade": "true",
 			"com.docker.network.bridge.host_binding_ipv4":    "0.0.0.0",
 			"com.docker.network.bridge.name":                 "pterodactyl0",

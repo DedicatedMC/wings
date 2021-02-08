@@ -2,21 +2,22 @@ package router
 
 import (
 	"bytes"
+	"net/http"
+	"strings"
+
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/installer"
 	"github.com/pterodactyl/wings/server"
 	"github.com/pterodactyl/wings/system"
-	"net/http"
-	"strings"
 )
 
 // Returns information about the system that wings is running on.
 func getSystemInformation(c *gin.Context) {
 	i, err := system.GetSystemInformation()
 	if err != nil {
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 
 		return
 	}
@@ -45,7 +46,7 @@ func postCreateServer(c *gin.Context) {
 			return
 		}
 
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 		return
 	}
 
@@ -57,7 +58,11 @@ func postCreateServer(c *gin.Context) {
 	// cycle. If there are any errors they will be logged and communicated back
 	// to the Panel where a reinstall may take place.
 	go func(i *installer.Installer) {
-		i.Execute()
+		err := i.Server().CreateEnvironment()
+		if err != nil {
+			i.Server().Log().WithField("error", err).Error("failed to create server environment during install process")
+			return
+		}
 
 		if err := i.Server().Install(false); err != nil {
 			log.WithFields(log.Fields{"server": i.Uuid(), "error": err}).Error("failed to run install process for server")
@@ -71,7 +76,7 @@ func postCreateServer(c *gin.Context) {
 func postUpdateConfiguration(c *gin.Context) {
 	// A backup of the configuration for error purposes.
 	ccopy := *config.Get()
-	// A copy of the configuration we're using to bind the data recevied into.
+	// A copy of the configuration we're using to bind the data received into.
 	cfg := *config.Get()
 
 	// BindJSON sends 400 if the request fails, all we need to do is return
@@ -85,8 +90,8 @@ func postUpdateConfiguration(c *gin.Context) {
 	//
 	// If you pass through manual locations in the API call this logic will be skipped.
 	if strings.HasPrefix(cfg.Api.Ssl.KeyFile, "/etc/letsencrypt/live/") {
-		cfg.Api.Ssl.KeyFile = ccopy.Api.Ssl.KeyFile
-		cfg.Api.Ssl.CertificateFile = ccopy.Api.Ssl.CertificateFile
+		cfg.Api.Ssl.KeyFile = strings.ToLower(ccopy.Api.Ssl.KeyFile)
+		cfg.Api.Ssl.CertificateFile = strings.ToLower(ccopy.Api.Ssl.CertificateFile)
 	}
 
 	config.Set(&cfg)
@@ -95,7 +100,7 @@ func postUpdateConfiguration(c *gin.Context) {
 		// before this code was run.
 		config.Set(&ccopy)
 
-		TrackedError(err).AbortWithServerError(c)
+		NewTrackedError(err).Abort(c)
 		return
 	}
 

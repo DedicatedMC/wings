@@ -1,17 +1,21 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/apex/log"
-	"github.com/creasty/defaults"
-	"github.com/gammazero/workerpool"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/api"
-	"github.com/pterodactyl/wings/environment"
-	"github.com/pterodactyl/wings/environment/docker"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
+	"github.com/gammazero/workerpool"
+	"github.com/pterodactyl/wings/api"
+	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/environment"
+	"github.com/pterodactyl/wings/environment/docker"
+	"github.com/pterodactyl/wings/server/filesystem"
 )
 
 var servers = NewCollection(nil)
@@ -28,40 +32,41 @@ func LoadDirectory() error {
 	}
 
 	log.Info("fetching list of servers from API")
-	configs, rerr, err := api.NewRequester().GetAllServerConfigurations()
-	if err != nil || rerr != nil {
-		if err != nil {
-			return errors.WithStack(err)
+	configs, err := api.New().GetServers()
+	if err != nil {
+		if !api.IsRequestError(err) {
+			return err
 		}
 
-		return errors.New(rerr.String())
-	}
-
-	log.Debug("retrieving cached server states from disk")
-	states, err := getServerStates()
-	if err != nil {
-		log.WithField("error", errors.WithStack(err)).Error("failed to retrieve locally cached server states from disk, assuming all servers in offline state")
+		return errors.New(err.Error())
 	}
 
 	start := time.Now()
 	log.WithField("total_configs", len(configs)).Info("processing servers returned by the API")
 
 	pool := workerpool.New(runtime.NumCPU())
-	for uuid, data := range configs {
-		uuid := uuid
+	log.Debugf("using %d workerpools to instantiate server instances", runtime.NumCPU())
+	for _, data := range configs {
 		data := data
 
 		pool.Submit(func() {
-			log.WithField("server", uuid).Info("creating new server object from API response")
-			s, err := FromConfiguration(data)
-			if err != nil {
-				log.WithField("server", uuid).WithField("error", err).Error("failed to load server, skipping...")
+			// Parse the json.RawMessage into an expected struct value. We do this here so that a single broken
+			// server does not cause the entire boot process to hang, and allows us to show more useful error
+			// messaging in the output.
+			d := api.ServerConfigurationResponse{
+				Settings: data.Settings,
+			}
+
+			log.WithField("server", data.Uuid).Info("creating new server object from API response")
+			if err := json.Unmarshal(data.ProcessConfiguration, &d.ProcessConfiguration); err != nil {
+				log.WithField("server", data.Uuid).WithField("error", err).Error("failed to parse server configuration from API response, skipping...")
 				return
 			}
 
-			if state, exists := states[s.Id()]; exists {
-				s.Log().WithField("state", state).Debug("found existing server state in cache file; re-instantiating server state")
-				s.SetState(state)
+			s, err := FromConfiguration(d)
+			if err != nil {
+				log.WithField("server", data.Uuid).WithField("error", err).Error("failed to load server, skipping...")
+				return
 			}
 
 			servers.Add(s)
@@ -81,24 +86,17 @@ func LoadDirectory() error {
 // Initializes a server using a data byte array. This will be marshaled into the
 // given struct using a YAML marshaler. This will also configure the given environment
 // for a server.
-func FromConfiguration(data *api.ServerConfigurationResponse) (*Server, error) {
-	cfg := Configuration{}
-	if err := defaults.Set(&cfg); err != nil {
-		return nil, errors.Wrap(err, "failed to set struct defaults for server configuration")
+func FromConfiguration(data api.ServerConfigurationResponse) (*Server, error) {
+	s, err := New()
+	if err != nil {
+		return nil, errors.WithMessage(err, "loader: failed to instantiate empty server struct")
 	}
-
-	s := new(Server)
-	if err := defaults.Set(s); err != nil {
-		return nil, errors.Wrap(err, "failed to set struct defaults for server")
-	}
-
-	s.cfg = cfg
 	if err := s.UpdateDataStructure(data.Settings); err != nil {
 		return nil, err
 	}
 
 	s.Archiver = Archiver{Server: s}
-	s.Filesystem = Filesystem{Server: s}
+	s.fs = filesystem.New(filepath.Join(config.Get().System.Data, s.Id()), s.DiskSpace())
 
 	// Right now we only support a Docker based environment, so I'm going to hard code
 	// this logic in. When we're ready to support other environment we'll need to make
@@ -111,7 +109,7 @@ func FromConfiguration(data *api.ServerConfigurationResponse) (*Server, error) {
 
 	envCfg := environment.NewConfiguration(settings, s.GetEnvironmentVariables())
 	meta := docker.Metadata{
-		Image:      s.Config().Container.Image,
+		Image: s.Config().Container.Image,
 	}
 
 	if env, err := docker.New(s.Id(), &meta, envCfg); err != nil {
@@ -119,6 +117,7 @@ func FromConfiguration(data *api.ServerConfigurationResponse) (*Server, error) {
 	} else {
 		s.Environment = env
 		s.StartEventListeners()
+		s.Throttler().StartTimer(s.Context())
 	}
 
 	// Forces the configuration to be synced with the panel.
@@ -127,8 +126,8 @@ func FromConfiguration(data *api.ServerConfigurationResponse) (*Server, error) {
 	}
 
 	// If the server's data directory exists, force disk usage calculation.
-	if _, err := os.Stat(s.Filesystem.Path()); err == nil {
-		go s.Filesystem.HasSpaceAvailable()
+	if _, err := os.Stat(s.Filesystem().Path()); err == nil {
+		s.Filesystem().HasSpaceAvailable(true)
 	}
 
 	return s, nil

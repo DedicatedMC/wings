@@ -3,8 +3,8 @@ package config
 import (
 	"encoding/base64"
 	"encoding/json"
+
 	"github.com/docker/docker/api/types"
-	"github.com/pkg/errors"
 )
 
 type dockerNetworkInterfaces struct {
@@ -49,18 +49,6 @@ type DockerConfiguration struct {
 	// Domainname is the Docker domainname for all containers.
 	Domainname string `default:"" json:"domainname" yaml:"domainname"`
 
-	// If true, container images will be updated when a server starts if there
-	// is an update available. If false the daemon will not attempt updates and will
-	// defer to the host system to manage image updates.
-	UpdateImages bool `default:"true" json:"update_images" yaml:"update_images"`
-
-	// The location of the Docker socket.
-	Socket string `default:"/var/run/docker.sock" json:"socket" yaml:"socket"`
-
-	// Defines the location of the timezone file on the host system that should
-	// be mounted into the created containers so that they all use the same time.
-	TimezonePath string `default:"/etc/timezone" json:"timezone_path" yaml:"timezone_path"`
-
 	// Registries .
 	Registries map[string]RegistryConfiguration `json:"registries" yaml:"registries"`
 
@@ -85,7 +73,7 @@ func (c RegistryConfiguration) Base64() (string, error) {
 
 	b, err := json.Marshal(authConfig)
 	if err != nil {
-		return "", errors.WithStack(err)
+		return "", err
 	}
 
 	return base64.URLEncoding.EncodeToString(b), nil

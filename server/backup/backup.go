@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"github.com/apex/log"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/api"
 	"github.com/pterodactyl/wings/config"
 	"io"
@@ -13,9 +12,11 @@ import (
 	"sync"
 )
 
+type AdapterType string
+
 const (
-	LocalBackupAdapter = "wings"
-	S3BackupAdapter    = "s3"
+	LocalBackupAdapter AdapterType = "wings"
+	S3BackupAdapter    AdapterType = "s3"
 )
 
 type ArchiveDetails struct {
@@ -41,7 +42,10 @@ type Backup struct {
 
 	// An array of files to ignore when generating this backup. This should be
 	// compatible with a standard .gitignore structure.
-	IgnoredFiles []string `json:"ignored_files"`
+	Ignore string `json:"ignore"`
+
+	adapter    AdapterType
+	logContext map[string]interface{}
 }
 
 // noinspection GoNameStartsWithPackageName
@@ -49,14 +53,17 @@ type BackupInterface interface {
 	// Returns the UUID of this backup as tracked by the panel instance.
 	Identifier() string
 
+	// Attaches additional context to the log output for this backup.
+	WithLogContext(map[string]interface{})
+
 	// Generates a backup in whatever the configured source for the specific
 	// implementation is.
-	Generate(*IncludedFiles, string) (*ArchiveDetails, error)
+	Generate(string, string) (*ArchiveDetails, error)
 
 	// Returns the ignored files for this backup instance.
-	Ignored() []string
+	Ignored() string
 
-	// Returns a SHA256 checksum for the generated backup.
+	// Returns a SHA1 checksum for the generated backup.
 	Checksum() ([]byte, error)
 
 	// Returns the size of the generated backup.
@@ -87,7 +94,7 @@ func (b *Backup) Path() string {
 func (b *Backup) Size() (int64, error) {
 	st, err := os.Stat(b.Path())
 	if err != nil {
-		return 0, errors.WithStack(err)
+		return 0, err
 	}
 
 	return st.Size(), nil
@@ -99,7 +106,7 @@ func (b *Backup) Checksum() ([]byte, error) {
 
 	f, err := os.Open(b.Path())
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 	defer f.Close()
 
@@ -117,20 +124,25 @@ func (b *Backup) Details() *ArchiveDetails {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 
+	l := log.WithField("backup_id", b.Uuid)
+
 	var checksum string
 	// Calculate the checksum for the file.
 	go func() {
 		defer wg.Done()
 
+		l.Info("computing checksum for backup...")
 		resp, err := b.Checksum()
 		if err != nil {
 			log.WithFields(log.Fields{
 				"backup": b.Identifier(),
 				"error":  err,
 			}).Error("failed to calculate checksum for backup")
+			return
 		}
 
 		checksum = hex.EncodeToString(resp)
+		l.WithField("checksum", checksum).Info("computed checksum for backup")
 	}()
 
 	var sz int64
@@ -153,6 +165,16 @@ func (b *Backup) Details() *ArchiveDetails {
 	}
 }
 
-func (b *Backup) Ignored() []string {
-	return b.IgnoredFiles
+func (b *Backup) Ignored() string {
+	return b.Ignore
+}
+
+// Returns a logger instance for this backup with the additional context fields
+// assigned to the output.
+func (b *Backup) log() *log.Entry {
+	l := log.WithField("backup", b.Identifier()).WithField("adapter", b.adapter)
+	for k, v := range b.logContext {
+		l = l.WithField(k, v)
+	}
+	return l
 }

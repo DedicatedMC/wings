@@ -2,9 +2,10 @@ package server
 
 import (
 	"encoding/json"
+
+	"emperror.dev/errors"
 	"github.com/buger/jsonparser"
 	"github.com/imdario/mergo"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/environment"
 )
 
@@ -18,7 +19,7 @@ import (
 func (s *Server) UpdateDataStructure(data []byte) error {
 	src := new(Configuration)
 	if err := json.Unmarshal(data, src); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	// Don't allow obviously corrupted data to pass through into this function. If the UUID
@@ -47,7 +48,7 @@ func (s *Server) UpdateDataStructure(data []byte) error {
 	// Merge the new data object that we have received with the existing server data object
 	// and then save it to the disk so it is persistent.
 	if err := mergo.Merge(&c, src, mergo.WithOverride); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	// Don't explode if we're setting CPU limits to 0. Mergo sees that as an empty value
@@ -65,7 +66,7 @@ func (s *Server) UpdateDataStructure(data []byte) error {
 	// request is going to be boolean. Allegedly.
 	if v, err := jsonparser.GetBoolean(data, "container", "oom_disabled"); err != nil {
 		if err != jsonparser.KeyPathNotFoundError {
-			return errors.WithStack(err)
+			return err
 		}
 	} else {
 		c.Build.OOMDisabled = v
@@ -74,10 +75,18 @@ func (s *Server) UpdateDataStructure(data []byte) error {
 	// Mergo also cannot handle this boolean value.
 	if v, err := jsonparser.GetBoolean(data, "suspended"); err != nil {
 		if err != jsonparser.KeyPathNotFoundError {
-			return errors.WithStack(err)
+			return err
 		}
 	} else {
 		c.Suspended = v
+	}
+
+	if v, err := jsonparser.GetBoolean(data, "skip_egg_scripts"); err != nil {
+		if err != jsonparser.KeyPathNotFoundError {
+			return err
+		}
+	} else {
+		c.SkipEggScripts = v
 	}
 
 	// Environment and Mappings should be treated as a full update at all times, never a
@@ -135,12 +144,14 @@ func (s *Server) SyncWithEnvironment() {
 	} else {
 		// Checks if the server is now in a suspended state. If so and a server process is currently running it
 		// will be gracefully stopped (and terminated if it refuses to stop).
-		s.Log().Info("server suspended with running process state, terminating now")
+		if s.Environment.State() != environment.ProcessOfflineState {
+			s.Log().Info("server suspended with running process state, terminating now")
 
-		go func (s *Server) {
-			if err := s.Environment.WaitForStop(60, true); err != nil {
-				s.Log().WithField("error", err).Warn("failed to terminate server environment after suspension")
-			}
-		}(s)
+			go func(s *Server) {
+				if err := s.Environment.WaitForStop(60, true); err != nil {
+					s.Log().WithField("error", err).Warn("failed to terminate server environment after suspension")
+				}
+			}(s)
+		}
 	}
 }

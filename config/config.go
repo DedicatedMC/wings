@@ -2,11 +2,6 @@ package config
 
 import (
 	"fmt"
-	"github.com/cobaugh/osrelease"
-	"github.com/creasty/defaults"
-	"github.com/gbrlsnchs/jwt/v3"
-	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -14,6 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"emperror.dev/errors"
+	"github.com/cobaugh/osrelease"
+	"github.com/creasty/defaults"
+	"github.com/gbrlsnchs/jwt/v3"
+	"gopkg.in/yaml.v2"
 )
 
 const DefaultLocation = "/etc/pterodactyl/config.yml"
@@ -47,23 +48,18 @@ type Configuration struct {
 	System SystemConfiguration `json:"system" yaml:"system"`
 	Docker DockerConfiguration `json:"docker" yaml:"docker"`
 
-	// The amount of time in seconds that should elapse between disk usage checks
-	// run by the daemon. Setting a higher number can result in better IO performance
-	// at an increased risk of a malicious user creating a process that goes over
-	// the assigned disk limits.
-	DiskCheckTimeout int `yaml:"disk_check_timeout"`
-
 	// Defines internal throttling configurations for server processes to prevent
 	// someone from running an endless loop that spams data to logs.
 	Throttles ConsoleThrottles
 
 	// The location where the panel is running that this daemon should connect to
 	// to collect data and send events.
-	PanelLocation string `json:"remote" yaml:"remote"`
+	PanelLocation string                   `json:"remote" yaml:"remote"`
+	RemoteQuery   RemoteQueryConfiguration `json:"remote_query" yaml:"remote_query"`
 
 	// AllowedMounts is a list of allowed host-system mount points.
 	// This is required to have the "Server Mounts" feature work properly.
-	AllowedMounts []string `json:"allowed_mounts" yaml:"allowed_mounts"`
+	AllowedMounts []string `json:"-" yaml:"allowed_mounts"`
 
 	// AllowedOrigins is a list of allowed request origins.
 	// The Panel URL is automatically allowed, this is only needed for adding
@@ -73,9 +69,6 @@ type Configuration struct {
 
 // Defines the configuration of the internal SFTP server.
 type SftpConfiguration struct {
-	// If set to true disk checking will not be performed. This will prevent the SFTP
-	// server from checking the total size of a directory when uploading files.
-	DisableDiskChecking bool `default:"false" yaml:"disable_disk_checking"`
 	// The bind address of the SFTP server.
 	Address string `default:"0.0.0.0" json:"bind_address" yaml:"bind_address"`
 	// The bind port of the SFTP server.
@@ -95,13 +88,39 @@ type ApiConfiguration struct {
 
 	// SSL configuration for the daemon.
 	Ssl struct {
-		Enabled         bool   `default:"false"`
+		Enabled         bool   `json:"enabled" yaml:"enabled"`
 		CertificateFile string `json:"cert" yaml:"cert"`
 		KeyFile         string `json:"key" yaml:"key"`
 	}
 
+	// Determines if functionality for allowing remote download of files into server directories
+	// is enabled on this instance. If set to "true" remote downloads will not be possible for
+	// servers.
+	DisableRemoteDownload bool `json:"disable_remote_download" yaml:"disable_remote_download"`
+
 	// The maximum size for files uploaded through the Panel in bytes.
 	UploadLimit int `default:"100" json:"upload_limit" yaml:"upload_limit"`
+}
+
+// Defines the configuration settings for remote requests from Wings to the Panel.
+type RemoteQueryConfiguration struct {
+	// The amount of time in seconds that Wings should allow for a request to the Panel API
+	// to complete. If this time passes the request will be marked as failed. If your requests
+	// are taking longer than 30 seconds to complete it is likely a performance issue that
+	// should be resolved on the Panel, and not something that should be resolved by upping this
+	// number.
+	Timeout uint `default:"30" yaml:"timeout"`
+
+	// The number of servers to load in a single request to the Panel API when booting the
+	// Wings instance. A single request is initially made to the Panel to get this number
+	// of servers, and then the pagination status is checked and additional requests are
+	// fired off in parallel to request the remaining pages.
+	//
+	// It is not recommended to change this from the default as you will likely encounter
+	// memory limits on your Panel instance. In the grand scheme of things 4 requests for
+	// 50 servers is likely just as quick as two for 100 or one for 400, and will certainly
+	// be less likely to cause performance issues on the Panel.
+	BootServersPerPage uint `default:"50" yaml:"boot_servers_per_page"`
 }
 
 // Reads the configuration from the provided file and returns the configuration
@@ -179,7 +198,7 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 func NewFromPath(path string) (*Configuration, error) {
 	c := new(Configuration)
 	if err := defaults.Set(c); err != nil {
-		return c, errors.WithStack(err)
+		return c, err
 	}
 
 	c.unsafeSetPath(path)
@@ -188,7 +207,7 @@ func NewFromPath(path string) (*Configuration, error) {
 }
 
 // Sets the path where the configuration file is located on the server. This function should
-// not be called except by processes that are generating the configuration such as the configration
+// not be called except by processes that are generating the configuration such as the configuration
 // command shipped with this software.
 func (c *Configuration) unsafeSetPath(path string) {
 	c.Lock()
@@ -210,6 +229,36 @@ func (c *Configuration) GetPath() string {
 // If files are not owned by this user there will be issues with permissions on Docker
 // mount points.
 func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
+	sysName, err := getSystemName()
+	if err != nil {
+		return nil, err
+	}
+
+	// Our way of detecting if wings is running inside of Docker.
+	if sysName == "busybox" {
+		uid := os.Getenv("WINGS_UID")
+		if uid == "" {
+			uid = "988"
+		}
+
+		gid := os.Getenv("WINGS_GID")
+		if gid == "" {
+			gid = "988"
+		}
+
+		username := os.Getenv("WINGS_USERNAME")
+		if username == "" {
+			username = "pterodactyl"
+		}
+
+		u := &user.User{
+			Uid:      uid,
+			Gid:      gid,
+			Username: username,
+		}
+		return u, c.setSystemUser(u)
+	}
+
 	u, err := user.Lookup(c.System.Username)
 
 	// If an error is returned but it isn't the unknown user error just abort
@@ -217,35 +266,30 @@ func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
 	if err == nil {
 		return u, c.setSystemUser(u)
 	} else if _, ok := err.(user.UnknownUserError); !ok {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 
-	sysName, err := getSystemName()
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	var command = fmt.Sprintf("useradd --system --no-create-home --shell /bin/false %s", c.System.Username)
+	command := fmt.Sprintf("useradd --system --no-create-home --shell /usr/sbin/nologin %s", c.System.Username)
 
 	// Alpine Linux is the only OS we currently support that doesn't work with the useradd command, so
 	// in those cases we just modify the command a bit to work as expected.
 	if strings.HasPrefix(sysName, "alpine") {
-		command = fmt.Sprintf("adduser -S -D -H -G %[1]s -s /bin/false %[1]s", c.System.Username)
+		command = fmt.Sprintf("adduser -S -D -H -G %[1]s -s /sbin/nologin %[1]s", c.System.Username)
 
 		// We have to create the group first on Alpine, so do that here before continuing on
 		// to the user creation process.
 		if _, err := exec.Command("addgroup", "-S", c.System.Username).Output(); err != nil {
-			return nil, errors.WithStack(err)
+			return nil, err
 		}
 	}
 
 	split := strings.Split(command, " ")
 	if _, err := exec.Command(split[0], split[1:]...).Output(); err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 
 	if u, err := user.Lookup(c.System.Username); err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	} else {
 		return u, c.setSystemUser(u)
 	}
@@ -254,8 +298,15 @@ func (c *Configuration) EnsurePterodactylUser() (*user.User, error) {
 // Set the system user into the configuration and then write it to the disk so that
 // it is persisted on boot.
 func (c *Configuration) setSystemUser(u *user.User) error {
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(u.Gid)
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return err
+	}
+
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return err
+	}
 
 	c.Lock()
 	c.System.Username = u.Username
@@ -287,11 +338,11 @@ func (c *Configuration) WriteToDisk() error {
 
 	b, err := yaml.Marshal(&ccopy)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	if err := ioutil.WriteFile(c.GetPath(), b, 0644); err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 
 	return nil
@@ -301,7 +352,7 @@ func (c *Configuration) WriteToDisk() error {
 func getSystemName() (string, error) {
 	// use osrelease to get release version and ID
 	if release, err := osrelease.Read(); err != nil {
-		return "", errors.WithStack(err)
+		return "", err
 	} else {
 		return release["ID"], nil
 	}

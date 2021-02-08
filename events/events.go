@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+
+	"github.com/gammazero/workerpool"
 )
 
 type Event struct {
@@ -12,14 +14,13 @@ type Event struct {
 }
 
 type EventBus struct {
-	sync.RWMutex
-
-	subscribers map[string]map[chan Event]struct{}
+	mu    sync.RWMutex
+	pools map[string]*CallbackPool
 }
 
 func New() *EventBus {
 	return &EventBus{
-		subscribers: make(map[string]map[chan Event]struct{}),
+		pools: make(map[string]*CallbackPool),
 	}
 }
 
@@ -39,21 +40,32 @@ func (e *EventBus) Publish(topic string, data string) {
 		}
 	}
 
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	// Acquire a read lock and loop over all of the channels registered for the topic. This
 	// avoids a panic crash if the process tries to unregister the channel while this routine
 	// is running.
-	go func() {
-		e.RLock()
-		defer e.RUnlock()
-
-		if ch, ok := e.subscribers[t]; ok {
-			for channel := range ch {
-				channel <- Event{Data: data, Topic: topic}
-			}
+	if cp, ok := e.pools[t]; ok {
+		for _, callback := range cp.callbacks {
+			c := *callback
+			evt := Event{Data: data, Topic: topic}
+			// Using the workerpool with one worker allows us to execute events in a FIFO manner. Running
+			// this using goroutines would cause things such as console output to just output in random order
+			// if more than one event is fired at the same time.
+			//
+			// However, the pool submission does not block the execution of this function itself, allowing
+			// us to call publish without blocking any of the other pathways.
+			//
+			// @see https://github.com/pterodactyl/panel/issues/2303
+			cp.pool.Submit(func() {
+				c(evt)
+			})
 		}
-	}()
+	}
 }
 
+// Publishes a JSON message to a given topic.
 func (e *EventBus) PublishJson(topic string, data interface{}) error {
 	b, err := json.Marshal(data)
 	if err != nil {
@@ -65,41 +77,46 @@ func (e *EventBus) PublishJson(topic string, data interface{}) error {
 	return nil
 }
 
-// Subscribe to an emitter topic using a channel.
-func (e *EventBus) Subscribe(topic string, ch chan Event) {
-	e.Lock()
-	defer e.Unlock()
+// Register a callback function that will be executed each time one of the events using the topic
+// name is called.
+func (e *EventBus) On(topic string, callback *func(Event)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	if _, exists := e.subscribers[topic]; !exists {
-		e.subscribers[topic] = make(map[chan Event]struct{})
+	// Check if this topic has been registered at least once for the event listener, and if
+	// not create an empty struct for the topic.
+	if _, exists := e.pools[topic]; !exists {
+		e.pools[topic] = &CallbackPool{
+			callbacks: make([]*func(Event), 0),
+			pool:      workerpool.New(1),
+		}
 	}
 
-	// Only set the channel if there is not currently a matching one for this topic. This
-	// avoids registering two identical listeners for the same topic and causing pain in
-	// the unsubscribe functionality as well.
-	if _, exists := e.subscribers[topic][ch]; !exists {
-		e.subscribers[topic][ch] = struct{}{}
+	// If this callback is not already registered as an event listener, go ahead and append
+	// it to the array of callbacks for this topic.
+	e.pools[topic].Add(callback)
+}
+
+// Removes an event listener from the bus.
+func (e *EventBus) Off(topic string, callback *func(Event)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if cp, ok := e.pools[topic]; ok {
+		cp.Remove(callback)
 	}
 }
 
-// Unsubscribe a channel from a given topic.
-func (e *EventBus) Unsubscribe(topic string, ch chan Event) {
-	e.Lock()
-	defer e.Unlock()
+// Removes all of the event listeners that have been registered for any topic. Also stops the worker
+// pool to close that routine.
+func (e *EventBus) Destroy() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	if _, exists := e.subscribers[topic][ch]; exists {
-		delete(e.subscribers[topic], ch)
+	// Stop every pool that exists for a given callback topic.
+	for _, cp := range e.pools {
+		cp.pool.Stop()
 	}
-}
 
-// Removes all of the event listeners for the server. This is used when a server
-// is being deleted to avoid a bunch of de-reference errors cropping up. Obviously
-// should also check elsewhere and handle a server reference going nil, but this
-// won't hurt.
-func (e *EventBus) UnsubscribeAll() {
-	e.Lock()
-	defer e.Unlock()
-
-	// Reset the entire struct into an empty map.
-	e.subscribers = make(map[string]map[chan Event]struct{})
+	e.pools = make(map[string]*CallbackPool)
 }

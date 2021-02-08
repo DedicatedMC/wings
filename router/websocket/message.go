@@ -8,16 +8,13 @@ const (
 	SetStateEvent              = "set state"
 	SendServerLogsEvent        = "send logs"
 	SendCommandEvent           = "send command"
+	SendStatsEvent             = "send stats"
 	ErrorEvent                 = "daemon error"
+	JwtErrorEvent              = "jwt error"
 )
 
 type Message struct {
-	// The event to perform. Should be one of the following that are supported:
-	//
-	// - status : Returns the server's power state.
-	// - logs : Returns the server log data at the time of the request.
-	// - power : Performs a power action aganist the server based the data.
-	// - command : Performs a command on a server using the data field.
+	// The event to perform.
 	Event string `json:"event"`
 
 	// The data to pass along, only used by power/command currently. Other requests

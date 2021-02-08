@@ -11,20 +11,24 @@ import (
 	"net/url"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/pterodactyl/wings/environment"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/AlecAivazis/survey/v2/terminal"
-	"github.com/docker/cli/components/engine/pkg/parsers/operatingsystem"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/docker/docker/pkg/parsers/operatingsystem"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/system"
 	"github.com/spf13/cobra"
 )
 
-const DefaultHastebinUrl = "https://hastebin.com"
+const DefaultHastebinUrl = "https://ptero.co"
+const DefaultLogLines = 200
 
 var (
 	diagnosticsArgs struct {
@@ -32,6 +36,7 @@ var (
 		IncludeLogs        bool
 		ReviewBeforeUpload bool
 		HastebinURL        string
+		LogLines           int
 	}
 )
 
@@ -43,6 +48,7 @@ var diagnosticsCmd = &cobra.Command{
 
 func init() {
 	diagnosticsCmd.PersistentFlags().StringVar(&diagnosticsArgs.HastebinURL, "hastebin-url", DefaultHastebinUrl, "The url of the hastebin instance to use.")
+	diagnosticsCmd.PersistentFlags().IntVar(&diagnosticsArgs.LogLines, "log-lines", DefaultLogLines, "The number of log lines to include in the report")
 }
 
 // diagnosticsCmdRun collects diagnostics about wings, it's configuration and the node.
@@ -66,7 +72,7 @@ func diagnosticsCmdRun(cmd *cobra.Command, args []string) {
 			Name: "ReviewBeforeUpload",
 			Prompt: &survey.Confirm{
 				Message: "Do you want to review the collected data before uploading to hastebin.com?",
-				Help:    "The data, especially the logs, might contain sensitive information, so you should review it. You will be asked again if you want to uplaod.",
+				Help:    "The data, especially the logs, might contain sensitive information, so you should review it. You will be asked again if you want to upload.",
 				Default: true,
 			},
 		},
@@ -82,38 +88,41 @@ func diagnosticsCmdRun(cmd *cobra.Command, args []string) {
 	_ = dockerInfo
 
 	output := &strings.Builder{}
-	fmt.Fprintln(output, "Pterodactly Wings - Diagnostics Report")
+	fmt.Fprintln(output, "Pterodactyl Wings - Diagnostics Report")
 	printHeader(output, "Versions")
-	fmt.Fprintln(output, "wings:", system.Version)
+	fmt.Fprintln(output, "         wings:", system.Version)
 	if dockerErr == nil {
-		fmt.Fprintln(output, "Docker", dockerVersion.Version)
+		fmt.Fprintln(output, "Docker:", dockerVersion.Version)
 	}
 	if v, err := kernel.GetKernelVersion(); err == nil {
 		fmt.Fprintln(output, "Kernel:", v)
 	}
 	if os, err := operatingsystem.GetOperatingSystem(); err == nil {
-		fmt.Fprintln(output, "OS:", os)
+		fmt.Fprintln(output, "    OS:", os)
 	}
 
 	printHeader(output, "Wings Configuration")
-	if cfg, err := config.ReadConfiguration(config.DefaultLocation); cfg != nil {
-		fmt.Fprintln(output, "Panel Location:", redact(cfg.PanelLocation))
-		fmt.Fprintln(output, "Api Host:", redact(cfg.Api.Host))
-		fmt.Fprintln(output, "Api Port:", cfg.Api.Port)
-		fmt.Fprintln(output, "Api Ssl Enabled:", cfg.Api.Ssl.Enabled)
-		fmt.Fprintln(output, "Api Ssl Certificate:", redact(cfg.Api.Ssl.CertificateFile))
-		fmt.Fprintln(output, "Api Ssl Key:", redact(cfg.Api.Ssl.KeyFile))
-		fmt.Fprintln(output, "Sftp Address:", redact(cfg.System.Sftp.Address))
-		fmt.Fprintln(output, "Sftp Port:", cfg.System.Sftp.Port)
-		fmt.Fprintln(output, "Sftp Read Only:", cfg.System.Sftp.ReadOnly)
-		fmt.Fprintln(output, "Sftp Diskchecking Disabled:", cfg.System.Sftp.DisableDiskChecking)
-		fmt.Fprintln(output, "System Root Directory:", cfg.System.RootDirectory)
-		fmt.Fprintln(output, "System Logs Directory:", cfg.System.LogDirectory)
-		fmt.Fprintln(output, "System Data Directory:", cfg.System.Data)
-		fmt.Fprintln(output, "System Archive Directory:", cfg.System.ArchiveDirectory)
-		fmt.Fprintln(output, "System Backup Directory:", cfg.System.BackupDirectory)
-		fmt.Fprintln(output, "System Username:", cfg.System.Username)
-		fmt.Fprintln(output, "Debug Enabled:", cfg.Debug)
+	cfg, err := config.ReadConfiguration(config.DefaultLocation)
+	if cfg != nil {
+		fmt.Fprintln(output, "    Panel Location:", redact(cfg.PanelLocation))
+		fmt.Fprintln(output, "")
+		fmt.Fprintln(output, " Internal Webserver:", redact(cfg.Api.Host), ":", cfg.Api.Port)
+		fmt.Fprintln(output, "        SSL Enabled:", cfg.Api.Ssl.Enabled)
+		fmt.Fprintln(output, "    SSL Certificate:", redact(cfg.Api.Ssl.CertificateFile))
+		fmt.Fprintln(output, "            SSL Key:", redact(cfg.Api.Ssl.KeyFile))
+		fmt.Fprintln(output, "")
+		fmt.Fprintln(output, "        SFTP Server:", redact(cfg.System.Sftp.Address), ":", cfg.System.Sftp.Port)
+		fmt.Fprintln(output, "     SFTP Read-Only:", cfg.System.Sftp.ReadOnly)
+		fmt.Fprintln(output, "")
+		fmt.Fprintln(output, "     Root Directory:", cfg.System.RootDirectory)
+		fmt.Fprintln(output, "     Logs Directory:", cfg.System.LogDirectory)
+		fmt.Fprintln(output, "     Data Directory:", cfg.System.Data)
+		fmt.Fprintln(output, "  Archive Directory:", cfg.System.ArchiveDirectory)
+		fmt.Fprintln(output, "   Backup Directory:", cfg.System.BackupDirectory)
+		fmt.Fprintln(output, "")
+		fmt.Fprintln(output, "           Username:", cfg.System.Username)
+		fmt.Fprintln(output, "        Server Time:", time.Now().Format(time.RFC1123Z))
+		fmt.Fprintln(output, "         Debug Mode:", cfg.Debug)
 	} else {
 		fmt.Println("Failed to load configuration.", err)
 	}
@@ -132,7 +141,7 @@ func diagnosticsCmdRun(cmd *cobra.Command, args []string) {
 		}
 	}
 	fmt.Fprintln(output, "LoggingDriver:", dockerInfo.LoggingDriver)
-	fmt.Fprintln(output, "CgroupDriver:", dockerInfo.CgroupDriver)
+	fmt.Fprintln(output, " CgroupDriver:", dockerInfo.CgroupDriver)
 	if len(dockerInfo.Warnings) > 0 {
 		for _, w := range dockerInfo.Warnings {
 			fmt.Fprintln(output, w)
@@ -149,7 +158,15 @@ func diagnosticsCmdRun(cmd *cobra.Command, args []string) {
 
 	printHeader(output, "Latest Wings Logs")
 	if diagnosticsArgs.IncludeLogs {
-		fmt.Fprintln(output, "No logs found. Probably because nobody implemented logging to files yet :(")
+		p := "/var/log/pterodactyl/wings.log"
+		if cfg != nil {
+			p = path.Join(cfg.System.LogDirectory, "wings.log")
+		}
+		if c, err := exec.Command("tail", "-n", strconv.Itoa(diagnosticsArgs.LogLines), p).Output(); err != nil {
+			fmt.Fprintln(output, "No logs found or an error occurred.")
+		} else {
+			fmt.Fprintf(output, "%s\n", string(c))
+		}
 	} else {
 		fmt.Fprintln(output, "Logs redacted.")
 	}
@@ -171,7 +188,7 @@ func diagnosticsCmdRun(cmd *cobra.Command, args []string) {
 }
 
 func getDockerInfo() (types.Version, types.Info, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	cli, err := environment.DockerClient()
 	if err != nil {
 		return types.Version{}, types.Info{}, err
 	}
@@ -210,7 +227,7 @@ func uploadToHastebin(hbUrl, content string) (string, error) {
 		u.Path = path.Join(u.Path, key)
 		return u.String(), nil
 	}
-	return "", errors.New("Couldn't find key in response")
+	return "", errors.New("failed to find key in response")
 }
 
 func redact(s string) string {

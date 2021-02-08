@@ -1,14 +1,18 @@
 package environment
 
 import (
-	"github.com/pterodactyl/wings/events"
 	"os"
+
+	"github.com/pterodactyl/wings/events"
 )
 
 const (
-	ConsoleOutputEvent = "console output"
-	StateChangeEvent   = "state change"
-	ResourceEvent      = "resources"
+	ConsoleOutputEvent       = "console output"
+	StateChangeEvent         = "state change"
+	ResourceEvent            = "resources"
+	DockerImagePullStarted   = "docker image pull started"
+	DockerImagePullStatus    = "docker image pull status"
+	DockerImagePullCompleted = "docker image pull completed"
 )
 
 const (
@@ -89,6 +93,14 @@ type ProcessEnvironment interface {
 	SendCommand(string) error
 
 	// Reads the log file for the process from the end backwards until the provided
-	// number of bytes is met.
-	Readlog(int64) ([]string, error)
+	// number of lines is met.
+	Readlog(int) ([]string, error)
+
+	// Returns the current state of the environment.
+	State() string
+
+	// Sets the current state of the environment. In general you should let the environment
+	// handle this itself, but there are some scenarios where it is helpful for the server
+	// to update the state externally (e.g. starting -> started).
+	SetState(string)
 }

@@ -1,8 +1,9 @@
 package server
 
 import (
-	"github.com/pterodactyl/wings/environment"
 	"sync"
+
+	"github.com/pterodactyl/wings/environment"
 )
 
 type Configuration struct {
@@ -19,6 +20,10 @@ type Configuration struct {
 
 	// The command that should be used when booting up the server instance.
 	Invocation string `json:"invocation"`
+
+	// By default this is false, however if selected within the Panel while installing or re-installing a
+	// server, specific installation scripts will be skipped for the server process.
+	SkipEggScripts bool `default:"false" json:"skip_egg_scripts"`
 
 	// An array of environment variables that should be passed along to the running
 	// server process.
@@ -43,11 +48,12 @@ func (s *Server) Config() *Configuration {
 	return &s.cfg
 }
 
+// Returns the amount of disk space available to a server in bytes.
 func (s *Server) DiskSpace() int64 {
 	s.cfg.mu.RLock()
 	defer s.cfg.mu.RUnlock()
 
-	return s.cfg.Build.DiskSpace
+	return s.cfg.Build.DiskSpace * 1024.0 * 1024.0
 }
 
 func (s *Server) MemoryLimit() int64 {

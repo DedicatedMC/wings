@@ -1,10 +1,33 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
-	"github.com/pkg/errors"
+	"strconv"
 )
+
+type BackupRemoteUploadResponse struct {
+	Parts    []string `json:"parts"`
+	PartSize int64    `json:"part_size"`
+}
+
+func (r *Request) GetBackupRemoteUploadURLs(backup string, size int64) (*BackupRemoteUploadResponse, error) {
+	resp, err := r.Get(fmt.Sprintf("/backups/%s", backup), Q{"size": strconv.FormatInt(size, 10)})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.HasError() {
+		return nil, resp.Error()
+	}
+
+	var res BackupRemoteUploadResponse
+	if err := resp.Bind(&res); err != nil {
+		return nil, err
+	}
+
+	return &res, nil
+}
 
 type BackupRequest struct {
 	Checksum     string `json:"checksum"`
@@ -15,22 +38,12 @@ type BackupRequest struct {
 
 // Notifies the panel that a specific backup has been completed and is now
 // available for a user to view and download.
-func (r *PanelRequest) SendBackupStatus(backup string, data BackupRequest) (*RequestError, error) {
-	b, err := json.Marshal(data)
+func (r *Request) SendBackupStatus(backup string, data BackupRequest) error {
+	resp, err := r.Post(fmt.Sprintf("/backups/%s", backup), data)
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	resp, err := r.Post(fmt.Sprintf("/backups/%s", backup), b)
-	if err != nil {
-		return nil, errors.WithStack(err)
+		return err
 	}
 	defer resp.Body.Close()
 
-	r.Response = resp
-	if r.HasError() {
-		return r.Error(), nil
-	}
-
-	return nil, nil
+	return resp.Error()
 }

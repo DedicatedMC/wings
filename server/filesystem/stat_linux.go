@@ -1,4 +1,4 @@
-package server
+package filesystem
 
 import (
 	"syscall"
@@ -9,5 +9,6 @@ import (
 func (s *Stat) CTime() time.Time {
 	st := s.Info.Sys().(*syscall.Stat_t)
 
+	// Do not remove these "redundant" type-casts, they are required for 32-bit builds to work.
 	return time.Unix(int64(st.Ctim.Sec), int64(st.Ctim.Nsec))
 }

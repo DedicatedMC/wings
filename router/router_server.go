@@ -3,36 +3,47 @@ package router
 import (
 	"bytes"
 	"context"
-	"github.com/apex/log"
-	"github.com/gin-gonic/gin"
-	"github.com/pkg/errors"
-	"github.com/pterodactyl/wings/server"
 	"net/http"
 	"os"
 	"strconv"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
+	"github.com/gin-gonic/gin"
+	"github.com/pterodactyl/wings/router/downloader"
+	"github.com/pterodactyl/wings/router/tokens"
+	"github.com/pterodactyl/wings/server"
 )
+
+type serverProcData struct {
+	server.ResourceUsage
+	Suspended bool `json:"suspended"`
+}
 
 // Returns a single server from the collection of servers.
 func getServer(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
-	p := *s.Proc()
-
-	c.JSON(http.StatusOK, p)
+	c.JSON(http.StatusOK, serverProcData{
+		ResourceUsage: s.Proc(),
+		Suspended:     s.IsSuspended(),
+	})
 }
 
 // Returns the logs for a given server instance.
 func getServerLogs(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
-	l, _ := strconv.ParseInt(c.DefaultQuery("size", "8192"), 10, 64)
+	l, _ := strconv.Atoi(c.DefaultQuery("size", "100"))
 	if l <= 0 {
-		l = 2048
+		l = 100
+	} else if l > 100 {
+		l = 100
 	}
 
 	out, err := s.ReadLogfile(l)
 	if err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
@@ -50,7 +61,7 @@ func getServerLogs(c *gin.Context) {
 func postServerPower(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
-	var data struct{
+	var data struct {
 		Action server.PowerAction `json:"action"`
 	}
 
@@ -78,7 +89,7 @@ func postServerPower(c *gin.Context) {
 		return
 	}
 
-	// Pass the actual heavy processing off to a seperate thread to handle so that
+	// Pass the actual heavy processing off to a separate thread to handle so that
 	// we can immediately return a response from the server. Some of these actions
 	// can take quite some time, especially stopping or restarting.
 	go func(s *server.Server) {
@@ -101,7 +112,7 @@ func postServerCommands(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
 	if running, err := s.Environment.IsRunning(); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	} else if !running {
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
@@ -135,7 +146,7 @@ func patchServer(c *gin.Context) {
 	buf.ReadFrom(c.Request.Body)
 
 	if err := s.UpdateDataStructure(buf.Bytes()); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		NewServerError(err, s).Abort(c)
 		return
 	}
 
@@ -161,27 +172,36 @@ func postServerInstall(c *gin.Context) {
 func postServerReinstall(c *gin.Context) {
 	s := GetServer(c.Param("server"))
 
-	go func(serv *server.Server) {
-		if err := serv.Reinstall(); err != nil {
-			serv.Log().WithField("error", err).Error("failed to complete server re-install process")
+	if s.ExecutingPowerAction() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "Cannot execute server reinstall event while another power action is running.",
+		})
+		return
+	}
+
+	go func(s *server.Server) {
+		if err := s.Reinstall(); err != nil {
+			s.Log().WithField("error", err).Error("failed to complete server re-install process")
 		}
 	}(s)
 
 	c.Status(http.StatusAccepted)
 }
 
-// Deletes a server from the wings daemon and deassociates its objects.
+// Deletes a server from the wings daemon and dissociate it's objects.
 func deleteServer(c *gin.Context) {
-	s := GetServer(c.Param("server"))
+	s := ExtractServer(c)
 
 	// Immediately suspend the server to prevent a user from attempting
 	// to start it while this process is running.
 	s.Config().SetSuspended(true)
 
-	// If the server is currently installing, abort it.
-	if s.IsInstalling() {
-		s.AbortInstallation()
-	}
+	// Stop all running background tasks for this server that are using the context on
+	// the server struct. This will cancel any running install processes for the server
+	// as well.
+	s.CtxCancel()
+	s.Events().Destroy()
+	s.Websockets().CancelAll()
 
 	// Delete the server's archive if it exists. We intentionally don't return
 	// here, if the archive fails to delete, the server can still be removed.
@@ -189,14 +209,17 @@ func deleteServer(c *gin.Context) {
 		s.Log().WithField("error", err).Warn("failed to delete server archive during deletion process")
 	}
 
-	// Unsubscribe all of the event listeners.
-	s.Events().UnsubscribeAll()
+	// Remove any pending remote file downloads for the server.
+	for _, dl := range downloader.ByServer(s.Id()) {
+		dl.Cancel()
+	}
 
 	// Destroy the environment; in Docker this will handle a running container and
 	// forcibly terminate it before removing the container, so we do not need to handle
 	// that here.
 	if err := s.Environment.Destroy(); err != nil {
-		TrackedServerError(err, s).AbortWithServerError(c)
+		WithError(c, err)
+		return
 	}
 
 	// Once the environment is terminated, remove the server files from the system. This is
@@ -207,20 +230,36 @@ func deleteServer(c *gin.Context) {
 	// so we don't want to block the HTTP call while waiting on this.
 	go func(p string) {
 		if err := os.RemoveAll(p); err != nil {
-			log.WithFields(log.Fields{
-				"path": p,
-				"error": errors.WithStack(err),
-			}).Warn("failed to remove server files during deletion process")
+			log.WithFields(log.Fields{"path": p, "error": err}).Warn("failed to remove server files during deletion process")
 		}
-	}(s.Filesystem.Path())
+	}(s.Filesystem().Path())
 
-	var uuid = s.Id()
+	uuid := s.Id()
 	server.GetServers().Remove(func(s2 *server.Server) bool {
 		return s2.Id() == uuid
 	})
 
 	// Deallocate the reference to this server.
 	s = nil
+
+	c.Status(http.StatusNoContent)
+}
+
+// Adds any of the JTIs passed through in the body to the deny list for the websocket
+// preventing any JWT generated before the current time from being used to connect to
+// the socket or send along commands.
+func postServerDenyWSTokens(c *gin.Context) {
+	var data struct {
+		JTIs []string `json:"jtis"`
+	}
+
+	if err := c.BindJSON(&data); err != nil {
+		return
+	}
+
+	for _, jti := range data.JTIs {
+		tokens.DenyJTI(jti)
+	}
 
 	c.Status(http.StatusNoContent)
 }

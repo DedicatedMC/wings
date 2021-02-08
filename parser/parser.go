@@ -3,20 +3,21 @@ package parser
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/beevik/etree"
 	"github.com/buger/jsonparser"
 	"github.com/icza/dyno"
 	"github.com/magiconair/properties"
-	"github.com/pkg/errors"
 	"github.com/pterodactyl/wings/config"
 	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v2"
-	"io/ioutil"
-	"os"
-	"regexp"
-	"strings"
 )
 
 // The file parsing options that are available for a server configuration file.
@@ -76,11 +77,6 @@ func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Regex to match paths such as foo[1].bar[2] and convert them into a format that
-// gabs can work with, such as foo.1.bar.2 in this case. This is applied when creating
-// the struct for the configuration file replacements.
-var cfrMatchReplacement = regexp.MustCompile(`\[(\d+)]`)
-
 // Defines a single find/replace instance for a given server configuration file.
 type ConfigurationFileReplacement struct {
 	Match       string       `json:"match"`
@@ -96,8 +92,7 @@ func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	// See comment on the replacement regex to understand what exactly this is doing.
-	cfr.Match = cfrMatchReplacement.ReplaceAllString(m, ".$1")
+	cfr.Match = m
 
 	iv, err := jsonparser.GetString(data, "if_value")
 	// We only check keypath here since match & replace_with should be present on all of
@@ -163,21 +158,26 @@ func (f *ConfigurationFile) Parse(path string, internal bool) error {
 		break
 	}
 
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		// File doesn't exist, we tried creating it, and same error is returned? Pretty
 		// sure this pathway is impossible, but if not, abort here.
 		if internal {
 			return nil
 		}
 
-		if _, err := os.Create(path); err != nil {
-			return errors.WithStack(err)
+		b := strings.TrimSuffix(path, filepath.Base(path))
+		if err := os.MkdirAll(b, 0755); err != nil {
+			return errors.WithMessage(err, "failed to create base directory for missing configuration file")
+		} else {
+			if _, err := os.Create(path); err != nil {
+				return errors.WithMessage(err, "failed to create missing configuration file")
+			}
 		}
 
 		return f.Parse(path, true)
 	}
 
-	return errors.WithStack(err)
+	return err
 }
 
 // Parses an xml file.
@@ -220,7 +220,7 @@ func (f *ConfigurationFile) parseXmlFile(path string) error {
 			parts := strings.Split(replacement.Match, ".")
 
 			// Set the initial element to be the root element, and then work from there.
-			var element = doc.Root()
+			element := doc.Root()
 
 			// Iterate over the path to create the required structure for the given element's path.
 			// This does not set a value, only ensures that the base structure exists. We start at index
@@ -359,7 +359,7 @@ func (f *ConfigurationFile) parseYamlFile(path string) error {
 
 	// Unmarshal the yaml data into a JSON interface such that we can work with
 	// any arbitrary data structure. If we don't do this, I can't use gabs which
-	// makes working with unknown JSON signficiantly easier.
+	// makes working with unknown JSON significantly easier.
 	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
 	if err != nil {
 		return err
@@ -385,38 +385,25 @@ func (f *ConfigurationFile) parseYamlFile(path string) error {
 // scanning a file and performing a replacement. You should attempt to use anything other
 // than this function where possible.
 func (f *ConfigurationFile) parseTextFile(path string) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	input, err := ioutil.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		hasReplaced := false
-		t := scanner.Text()
-
-		// Iterate over the potential replacements for the line and check if there are
-		// any matches.
+	lines := strings.Split(string(input), "\n")
+	for i, line := range lines {
 		for _, replace := range f.Replace {
-			if !strings.HasPrefix(t, replace.Match) {
+			// If this line doesn't match what we expect for the replacement, move on to the next
+			// line. Otherwise, update the line to have the replacement value.
+			if !strings.HasPrefix(line, replace.Match) {
 				continue
 			}
 
-			hasReplaced = true
-			t = strings.Replace(t, replace.Match, replace.ReplaceWith.String(), 1)
-		}
-
-		// If there was a replacement that occurred on this specific line, do a write to the file
-		// immediately to write that modified content to the disk.
-		if hasReplaced {
-			if _, err := file.WriteAt([]byte(t), int64(len(scanner.Bytes()))); err != nil {
-				return err
-			}
+			lines[i] = replace.ReplaceWith.String()
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := ioutil.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644); err != nil {
 		return err
 	}
 
@@ -426,11 +413,41 @@ func (f *ConfigurationFile) parseTextFile(path string) error {
 // Parses a properties file and updates the values within it to match those that
 // are passed. Writes the file once completed.
 func (f *ConfigurationFile) parsePropertiesFile(path string) error {
+	// Open the file.
+	f2, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+
+	var s strings.Builder
+
+	// Get any header comments from the file.
+	scanner := bufio.NewScanner(f2)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if len(text) > 0 && text[0] != '#' {
+			break
+		}
+
+		s.WriteString(text)
+		s.WriteString("\n")
+	}
+
+	// Close the file.
+	_ = f2.Close()
+
+	// Handle any scanner errors.
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	// Decode the properties file.
 	p, err := properties.LoadFile(path, properties.UTF8)
 	if err != nil {
 		return err
 	}
 
+	// Replace any values that need to be replaced.
 	for _, replace := range f.Replace {
 		data, err := f.LookupConfigurationValue(replace)
 		if err != nil {
@@ -450,23 +467,28 @@ func (f *ConfigurationFile) parsePropertiesFile(path string) error {
 		}
 	}
 
+	// Add the new file content to the string builder.
+	for _, key := range p.Keys() {
+		value, ok := p.Get(key)
+		if !ok {
+			continue
+		}
+
+		s.WriteString(key)
+		s.WriteByte('=')
+		s.WriteString(strings.Trim(strconv.QuoteToASCII(value), `"`))
+		s.WriteString("\n")
+	}
+
+	// Open the file for writing.
 	w, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
+	defer w.Close()
 
-	var s string
-	// This is a copy of the properties.String() func except we don't plop spaces around
-	// the key=value configurations since people like to complain about that.
-	// func (p *Properties) String() string
-	for _, key := range p.Keys() {
-		value, _ := p.Get(key)
-
-		s = fmt.Sprintf("%s%s=%s\n", s, key, value)
-	}
-
-	// Can't use the properties.Write() function since that doesn't apply our nicer formatting.
-	if _, err := w.Write([]byte(s)); err != nil {
+	// Write the data to the file.
+	if _, err := w.Write([]byte(s.String())); err != nil {
 		return err
 	}
 

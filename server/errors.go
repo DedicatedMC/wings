@@ -1,17 +1,15 @@
 package server
 
-type suspendedError struct {
-}
+import (
+	"emperror.dev/errors"
+)
 
-func (e *suspendedError) Error() string {
-	return "server is currently in a suspended state"
-}
-
-func IsSuspendedError(err error) bool {
-	_, ok := err.(*suspendedError)
-
-	return ok
-}
+var (
+	ErrIsRunning            = errors.New("server is running")
+	ErrSuspended            = errors.New("server is currently in a suspended state")
+	ErrServerIsInstalling   = errors.New("server is currently installing")
+	ErrServerIsTransferring = errors.New("server is currently being transferred")
+)
 
 type crashTooFrequent struct {
 }
